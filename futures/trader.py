@@ -15,25 +15,68 @@ Direction = Literal["long", "short"]
 
 class FuturesTrader:
     def __init__(self, settings: Settings) -> None:
-        self.settings = settings
-        self.symbol = settings.futures_symbol
-        self.exchange = create_okx_exchange(settings, "swap")
-        self.exchange.load_markets()
-        self.risk = RiskManager(settings, self.exchange)
-        self.configure_margin_and_leverage()
+        try:
+            self.settings = settings
+            self.symbol = settings.futures_symbol
+            self.exchange = create_okx_exchange(settings, "swap")
+            self.exchange.load_markets()
+            self.risk = RiskManager(settings, self.exchange)
+            self.configure_margin_and_leverage()
+        except Exception:
+            LOGGER.exception("Futures trader initialization failed.")
+            raise
 
     def configure_margin_and_leverage(self) -> None:
-        params = {"mgnMode": self.settings.futures_margin_mode}
+        margin_mode = self.settings.futures_margin_mode
+        leverage = self.settings.futures_leverage
+        position_sides = self._leverage_position_sides()
+
         if self.settings.dry_run:
             LOGGER.info(
-                "DRY_RUN futures margin=%s leverage=%sx",
-                self.settings.futures_margin_mode,
-                self.settings.futures_leverage,
+                "DRY_RUN futures position_mode=%s margin=%s leverage=%sx pos_sides=%s",
+                self.settings.futures_position_mode,
+                margin_mode,
+                leverage,
+                position_sides,
             )
             return
 
-        self.exchange.set_margin_mode(self.settings.futures_margin_mode, self.symbol, params)
-        self.exchange.set_leverage(self.settings.futures_leverage, self.symbol, params)
+        try:
+            hedged = self.settings.futures_position_mode == "long_short"
+            LOGGER.info("Setting futures position mode: hedged=%s", hedged)
+            self.exchange.set_position_mode(hedged)
+
+            for pos_side in position_sides:
+                margin_params = self._margin_mode_params(pos_side, leverage)
+                leverage_params = self._leverage_params(pos_side)
+
+                LOGGER.info(
+                    "Setting futures margin mode: symbol=%s margin=%s posSide=%s",
+                    self.symbol,
+                    margin_mode,
+                    pos_side,
+                )
+                self.exchange.set_margin_mode(margin_mode, self.symbol, margin_params)
+
+                LOGGER.info(
+                    "Setting futures leverage: symbol=%s leverage=%sx margin=%s posSide=%s",
+                    self.symbol,
+                    leverage,
+                    margin_mode,
+                    pos_side,
+                )
+                self.exchange.set_leverage(leverage, self.symbol, leverage_params)
+        except Exception:
+            LOGGER.exception(
+                "Futures margin/leverage configuration failed: symbol=%s margin=%s "
+                "leverage=%s position_mode=%s pos_sides=%s",
+                self.symbol,
+                margin_mode,
+                leverage,
+                self.settings.futures_position_mode,
+                position_sides,
+            )
+            raise
 
     def run_once(self) -> dict[str, Any] | list[dict[str, Any]] | None:
         breached, ratio = self.risk.margin_ratio_breached()
@@ -233,6 +276,25 @@ class FuturesTrader:
         if self.settings.futures_position_mode == "long_short":
             return {"posSide": direction}
         return {}
+
+    def _leverage_position_sides(self) -> list[str]:
+        if self.settings.futures_position_mode == "long_short":
+            return ["long", "short"]
+        return ["net"]
+
+    def _margin_mode_params(self, pos_side: str, leverage: int) -> dict[str, Any]:
+        # ccxt's OKX set_margin_mode() maps to OKX's set-leverage endpoint and
+        # requires `lever`; set_leverage() is still called separately below.
+        params: dict[str, Any] = {"lever": leverage}
+        if self.settings.futures_margin_mode == "isolated":
+            params["posSide"] = pos_side
+        return params
+
+    def _leverage_params(self, pos_side: str) -> dict[str, Any]:
+        params: dict[str, Any] = {"mgnMode": self.settings.futures_margin_mode}
+        if self.settings.futures_margin_mode == "isolated":
+            params["posSide"] = pos_side
+        return params
 
     def _normalize_amount(self, amount: float) -> float:
         normalized = float(self.exchange.amount_to_precision(self.symbol, amount))

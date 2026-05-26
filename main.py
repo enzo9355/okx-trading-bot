@@ -4,6 +4,7 @@ import argparse
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future
 from time import monotonic
 from typing import Callable
 
@@ -40,32 +41,57 @@ def run_loop(
     once: bool,
     stop_event: threading.Event,
 ) -> None:
-    trader = trader_factory(settings)
-    LOGGER.info(
-        "%s trader started. sandbox=%s dry_run=%s interval=%ss",
+    try:
+        trader = trader_factory(settings)
+        LOGGER.info(
+            "%s trader started. sandbox=%s dry_run=%s interval=%ss",
+            name,
+            settings.sandbox_mode,
+            settings.dry_run,
+            settings.trade_interval_seconds,
+        )
+
+        while not stop_event.is_set():
+            started = monotonic()
+            try:
+                trader.run_once()
+            except RiskLimitError as exc:
+                LOGGER.error("%s trader stopped by risk control: %s", name, exc)
+                stop_event.set()
+                return
+            except Exception:
+                LOGGER.exception("%s trader cycle failed.", name)
+
+            if once:
+                return
+
+            elapsed = monotonic() - started
+            wait_seconds = max(settings.trade_interval_seconds - elapsed, 0)
+            stop_event.wait(wait_seconds)
+    except Exception as exc:
+        LOGGER.exception("%s worker crashed: %s", name, exc)
+        stop_event.set()
+        raise
+
+
+def submit_worker(
+    executor: ThreadPoolExecutor,
+    name: str,
+    factory: Callable[[Settings], object],
+    settings: Settings,
+    *,
+    once: bool,
+    stop_event: threading.Event,
+) -> Future[None]:
+    LOGGER.info("starting %s worker", name)
+    return executor.submit(
+        run_loop,
         name,
-        settings.sandbox_mode,
-        settings.dry_run,
-        settings.trade_interval_seconds,
+        factory,
+        settings,
+        once=once,
+        stop_event=stop_event,
     )
-
-    while not stop_event.is_set():
-        started = monotonic()
-        try:
-            trader.run_once()
-        except RiskLimitError as exc:
-            LOGGER.error("%s trader stopped by risk control: %s", name, exc)
-            stop_event.set()
-            return
-        except Exception:
-            LOGGER.exception("%s trader cycle failed.", name)
-
-        if once:
-            return
-
-        elapsed = monotonic() - started
-        wait_seconds = max(settings.trade_interval_seconds - elapsed, 0)
-        stop_event.wait(wait_seconds)
 
 
 def main() -> None:
@@ -87,24 +113,32 @@ def main() -> None:
     try:
         if len(jobs) == 1:
             name, factory = jobs[0]
+            LOGGER.info("starting %s worker", name)
             run_loop(name, factory, settings, once=args.once, stop_event=stop_event)
             return
 
+        LOGGER.info("both mode initialized")
         with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
-            futures = [
-                executor.submit(
-                    run_loop,
+            futures = {
+                submit_worker(
+                    executor,
                     name,
                     factory,
                     settings,
                     once=args.once,
                     stop_event=stop_event,
-                )
+                ): name
                 for name, factory in jobs
-            ]
+            }
             for future in as_completed(futures):
-                future.result()
+                worker_name = futures[future]
+                try:
+                    future.result()
+                except Exception:
+                    stop_event.set()
+                    raise SystemExit(1)
                 if not args.once:
+                    LOGGER.warning("%s worker exited unexpectedly.", worker_name)
                     stop_event.set()
                     break
     except KeyboardInterrupt:
