@@ -1,0 +1,2 @@
+"""Spot trading module."""
+
