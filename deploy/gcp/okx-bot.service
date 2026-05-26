@@ -1,0 +1,27 @@
+[Unit]
+Description=OKX Trading Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=okxbot
+Group=okxbot
+WorkingDirectory=/opt/okx-trading-bot
+EnvironmentFile=/etc/okx-trading-bot/okx-bot.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/okx-trading-bot/.venv/bin/python /opt/okx-trading-bot/main.py --mode both
+Restart=always
+RestartSec=15
+KillSignal=SIGINT
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/okx-trading-bot/data /opt/okx-trading-bot/logs
+
+[Install]
+WantedBy=multi-user.target
