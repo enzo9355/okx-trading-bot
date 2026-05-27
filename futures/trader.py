@@ -6,7 +6,7 @@ from typing import Any, Literal
 from core.config import Settings
 from core.exchange import create_okx_exchange
 from core.risk import RiskLimitError, RiskManager
-from core.strategy import MovingAverageSignal, moving_average_cross_signal
+from core.strategy import MovingAverageSignal, moving_average_cross_signal_with_rsi
 
 
 LOGGER = logging.getLogger(__name__)
@@ -90,12 +90,13 @@ class FuturesTrader:
 
         signal = self.fetch_signal()
         LOGGER.info(
-            "Futures signal=%s prev_ma5=%.2f prev_ma20=%.2f ma5=%.2f ma20=%.2f",
+            "Futures signal=%s prev_ma5=%.2f prev_ma20=%.2f ma5=%.2f ma20=%.2f rsi=%s",
             signal.signal,
             signal.previous_fast,
             signal.previous_slow,
             signal.current_fast,
             signal.current_slow,
+            f"{signal.rsi:.2f}" if signal.rsi is not None else "n/a",
         )
 
         if signal.signal == "hold":
@@ -125,7 +126,14 @@ class FuturesTrader:
             limit=self.settings.ohlcv_limit,
         )
         closes = [float(candle[4]) for candle in candles]
-        return moving_average_cross_signal(closes, fast=5, slow=20)
+        return moving_average_cross_signal_with_rsi(
+            closes,
+            fast=5,
+            slow=20,
+            rsi_period=self.settings.rsi_period,
+            rsi_overbought=self.settings.rsi_overbought,
+            rsi_oversold=self.settings.rsi_oversold,
+        )
 
     def fetch_last_price(self) -> float:
         ticker = self.exchange.fetch_ticker(self.symbol)
@@ -283,8 +291,6 @@ class FuturesTrader:
         return ["net"]
 
     def _margin_mode_params(self, pos_side: str, leverage: int) -> dict[str, Any]:
-        # ccxt's OKX set_margin_mode() maps to OKX's set-leverage endpoint and
-        # requires `lever`; set_leverage() is still called separately below.
         params: dict[str, Any] = {"lever": leverage}
         if self.settings.futures_margin_mode == "isolated":
             params["posSide"] = pos_side
@@ -342,4 +348,3 @@ class FuturesTrader:
             return abs(float(contracts or 0))
         except (TypeError, ValueError):
             return 0.0
-

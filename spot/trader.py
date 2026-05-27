@@ -6,7 +6,7 @@ from typing import Any
 from core.config import Settings
 from core.exchange import create_okx_exchange
 from core.risk import RiskLimitError, RiskManager
-from core.strategy import MovingAverageSignal, moving_average_cross_signal
+from core.strategy import MovingAverageSignal, moving_average_cross_signal_with_rsi
 
 
 LOGGER = logging.getLogger(__name__)
@@ -23,12 +23,13 @@ class SpotTrader:
     def run_once(self) -> dict[str, Any] | None:
         signal = self.fetch_signal()
         LOGGER.info(
-            "Spot signal=%s prev_ma5=%.2f prev_ma20=%.2f ma5=%.2f ma20=%.2f",
+            "Spot signal=%s prev_ma5=%.2f prev_ma20=%.2f ma5=%.2f ma20=%.2f rsi=%s",
             signal.signal,
             signal.previous_fast,
             signal.previous_slow,
             signal.current_fast,
             signal.current_slow,
+            f"{signal.rsi:.2f}" if signal.rsi is not None else "n/a",
         )
 
         if signal.signal == "hold":
@@ -58,7 +59,14 @@ class SpotTrader:
             limit=self.settings.ohlcv_limit,
         )
         closes = [float(candle[4]) for candle in candles]
-        return moving_average_cross_signal(closes, fast=5, slow=20)
+        return moving_average_cross_signal_with_rsi(
+            closes,
+            fast=5,
+            slow=20,
+            rsi_period=self.settings.rsi_period,
+            rsi_overbought=self.settings.rsi_overbought,
+            rsi_oversold=self.settings.rsi_oversold,
+        )
 
     def fetch_last_price(self) -> float:
         ticker = self.exchange.fetch_ticker(self.symbol)
@@ -135,4 +143,3 @@ class SpotTrader:
         if normalized <= 0:
             raise RiskLimitError("Spot price must be greater than 0 after precision normalization.")
         return normalized
-
