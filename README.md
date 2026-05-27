@@ -1,16 +1,16 @@
 # OKX Auto Trading Bot
 
-Python + CCXT 的 OKX 自動交易 bot，支援現貨與 USDT 永續合約。預設使用 OKX sandbox / demo trading。
+Python + CCXT 的 OKX 自動交易 bot，支援多幣種現貨與 USDT 永續合約。預設使用 OKX sandbox / demo trading。
 
 ## 功能
 
-- 現貨：`BTC/USDT`
-- 合約：`BTC/USDT:USDT`，USDT 永續合約
+- 現貨：支援多個 `*/USDT` 交易對
+- 合約：支援多個 `*/USDT:USDT` USDT 永續合約
 - 現貨支援市價單與限價單
 - 合約支援開多、開空、平倉
 - 合約預設逐倉模式，固定 3x 槓桿
-- 合約開倉必須附帶 `stopLoss` 與 `takeProfit`
-- 策略：MA5 / MA20 均線交叉
+- 合約開倉附帶 `stopLoss` 與 `takeProfit`
+- 策略：每個交易對獨立跑 MA5 / MA20 均線交叉
 - 風控：單筆 5% 倉位上限、20% 保證金率保護、10% 每日虧損停機
 
 ## 本機安裝
@@ -32,6 +32,32 @@ SANDBOX_MODE=true
 DRY_RUN=true
 ```
 
+## 多幣種設定
+
+使用逗號分隔交易對：
+
+```env
+SPOT_SYMBOLS=BTC/USDT,ETH/USDT,SOL/USDT,XRP/USDT,DOGE/USDT
+FUTURES_SYMBOLS=BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT,XRP/USDT:USDT,DOGE/USDT:USDT
+```
+
+注意：
+
+- `SPOT_SYMBOLS` 用現貨格式，例如 `ETH/USDT`
+- `FUTURES_SYMBOLS` 用 OKX USDT 永續格式，例如 `ETH/USDT:USDT`
+- 每個 symbol 會建立獨立 worker
+- 目前策略會交易符合 MA5 / MA20 訊號的 symbol，不保證最大獲利
+- 幣種越多，API 呼叫與同時持倉風險越高
+
+舊設定仍可用：
+
+```env
+SPOT_SYMBOL=BTC/USDT
+FUTURES_SYMBOL=BTC/USDT:USDT
+```
+
+但多幣種建議使用 `SPOT_SYMBOLS` 與 `FUTURES_SYMBOLS`。
+
 ## 執行
 
 ```bash
@@ -40,7 +66,7 @@ python main.py --mode futures
 python main.py --mode both
 ```
 
-常用測試指令：
+測試指令：
 
 ```bash
 python main.py --mode spot --once --dry-run
@@ -87,4 +113,3 @@ sudo journalctl -u okx-bot -f
 - 確認 OKX 帳戶倉位模式與 `.env` 的 `FUTURES_POSITION_MODE` 一致
 - 確認 `stopLoss` / `takeProfit` 在你的 OKX 帳戶模式中可正常建立
 - 實盤前應使用固定 IP 並在 OKX 設定 API IP 白名單
-

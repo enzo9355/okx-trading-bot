@@ -13,9 +13,9 @@ LOGGER = logging.getLogger(__name__)
 
 
 class SpotTrader:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, *, symbol: str | None = None) -> None:
         self.settings = settings
-        self.symbol = settings.spot_symbol
+        self.symbol = symbol or settings.spot_symbol
         self.exchange = create_okx_exchange(settings, "spot")
         self.exchange.load_markets()
         self.risk = RiskManager(settings, self.exchange)
@@ -23,7 +23,8 @@ class SpotTrader:
     def run_once(self) -> dict[str, Any] | None:
         signal = self.fetch_signal()
         LOGGER.info(
-            "Spot signal=%s prev_ma5=%.2f prev_ma20=%.2f ma5=%.2f ma20=%.2f rsi=%s",
+            "Spot %s signal=%s prev_ma5=%.2f prev_ma20=%.2f ma5=%.2f ma20=%.2f rsi=%s",
+            self.symbol,
             signal.signal,
             signal.previous_fast,
             signal.previous_slow,
@@ -107,7 +108,8 @@ class SpotTrader:
 
         if self.settings.dry_run:
             LOGGER.info(
-                "DRY_RUN spot %s %s amount=%s price=%s params=%s",
+                "DRY_RUN spot %s %s %s amount=%s price=%s params=%s",
+                self.symbol,
                 side,
                 order_type,
                 amount_value,
@@ -124,7 +126,7 @@ class SpotTrader:
                 "params": params,
             }
 
-        LOGGER.info("Creating spot %s %s amount=%s price=%s", side, order_type, amount_value, price_value)
+        LOGGER.info("Creating spot %s %s %s amount=%s price=%s", self.symbol, side, order_type, amount_value, price_value)
         return self.exchange.create_order(self.symbol, order_type, side, amount_value, price_value, params)
 
     def _normalize_amount(self, amount: float) -> float:

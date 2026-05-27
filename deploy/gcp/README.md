@@ -67,6 +67,8 @@ SECRET_KEY=your_okx_secret_key
 PASSPHRASE=your_okx_api_passphrase
 SANDBOX_MODE=true
 DRY_RUN=true
+SPOT_SYMBOLS=BTC/USDT,ETH/USDT,SOL/USDT,XRP/USDT,DOGE/USDT
+FUTURES_SYMBOLS=BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT,XRP/USDT:USDT,DOGE/USDT:USDT
 ```
 
 Keep `SANDBOX_MODE=true` and `DRY_RUN=true` until you have checked logs and order behavior.

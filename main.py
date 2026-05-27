@@ -3,8 +3,9 @@ from __future__ import annotations
 import argparse
 import logging
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import Future
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from time import monotonic
 from typing import Callable
 
@@ -15,6 +16,14 @@ from spot.trader import SpotTrader
 
 
 LOGGER = logging.getLogger(__name__)
+TraderFactory = Callable[[Settings], object]
+
+
+@dataclass(frozen=True)
+class WorkerJob:
+    kind: str
+    symbol: str
+    factory: TraderFactory
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,8 +43,9 @@ def configure_logging() -> None:
 
 
 def run_loop(
-    name: str,
-    trader_factory: Callable[[Settings], object],
+    kind: str,
+    symbol: str,
+    trader_factory: TraderFactory,
     settings: Settings,
     *,
     once: bool,
@@ -44,8 +54,9 @@ def run_loop(
     try:
         trader = trader_factory(settings)
         LOGGER.info(
-            "%s trader started. sandbox=%s dry_run=%s interval=%ss",
-            name,
+            "%s trader started. symbol=%s sandbox=%s dry_run=%s interval=%ss",
+            kind,
+            symbol,
             settings.sandbox_mode,
             settings.dry_run,
             settings.trade_interval_seconds,
@@ -56,11 +67,11 @@ def run_loop(
             try:
                 trader.run_once()
             except RiskLimitError as exc:
-                LOGGER.error("%s trader stopped by risk control: %s", name, exc)
+                LOGGER.error("%s trader stopped by risk control: symbol=%s error=%s", kind, symbol, exc)
                 stop_event.set()
                 return
             except Exception:
-                LOGGER.exception("%s trader cycle failed.", name)
+                LOGGER.exception("%s trader cycle failed: symbol=%s", kind, symbol)
 
             if once:
                 return
@@ -69,29 +80,52 @@ def run_loop(
             wait_seconds = max(settings.trade_interval_seconds - elapsed, 0)
             stop_event.wait(wait_seconds)
     except Exception as exc:
-        LOGGER.exception("%s worker crashed: %s", name, exc)
+        LOGGER.exception("%s worker crashed: %s", kind, exc)
         stop_event.set()
         raise
 
 
 def submit_worker(
     executor: ThreadPoolExecutor,
-    name: str,
-    factory: Callable[[Settings], object],
+    job: WorkerJob,
     settings: Settings,
     *,
     once: bool,
     stop_event: threading.Event,
 ) -> Future[None]:
-    LOGGER.info("starting %s worker", name)
+    LOGGER.info("starting %s worker: symbol=%s", job.kind, job.symbol)
     return executor.submit(
         run_loop,
-        name,
-        factory,
+        job.kind,
+        job.symbol,
+        job.factory,
         settings,
         once=once,
         stop_event=stop_event,
     )
+
+
+def build_jobs(mode: str, settings: Settings) -> list[WorkerJob]:
+    jobs: list[WorkerJob] = []
+    if mode in {"spot", "both"}:
+        for symbol in settings.spot_symbols:
+            jobs.append(
+                WorkerJob(
+                    kind="spot",
+                    symbol=symbol,
+                    factory=lambda settings, symbol=symbol: SpotTrader(settings, symbol=symbol),
+                )
+            )
+    if mode in {"futures", "both"}:
+        for symbol in settings.futures_symbols:
+            jobs.append(
+                WorkerJob(
+                    kind="futures",
+                    symbol=symbol,
+                    factory=lambda settings, symbol=symbol: FuturesTrader(settings, symbol=symbol),
+                )
+            )
+    return jobs
 
 
 def main() -> None:
@@ -104,41 +138,42 @@ def main() -> None:
     settings.require_credentials()
 
     stop_event = threading.Event()
-    jobs: list[tuple[str, Callable[[Settings], object]]] = []
-    if args.mode in {"spot", "both"}:
-        jobs.append(("spot", SpotTrader))
-    if args.mode in {"futures", "both"}:
-        jobs.append(("futures", FuturesTrader))
+    jobs = build_jobs(args.mode, settings)
+    LOGGER.info(
+        "configured workers: spot=%s futures=%s",
+        list(settings.spot_symbols) if args.mode in {"spot", "both"} else [],
+        list(settings.futures_symbols) if args.mode in {"futures", "both"} else [],
+    )
 
     try:
         if len(jobs) == 1:
-            name, factory = jobs[0]
-            LOGGER.info("starting %s worker", name)
-            run_loop(name, factory, settings, once=args.once, stop_event=stop_event)
+            job = jobs[0]
+            LOGGER.info("starting %s worker: symbol=%s", job.kind, job.symbol)
+            run_loop(job.kind, job.symbol, job.factory, settings, once=args.once, stop_event=stop_event)
             return
 
-        LOGGER.info("both mode initialized")
+        if args.mode == "both":
+            LOGGER.info("both mode initialized")
         with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
             futures = {
                 submit_worker(
                     executor,
-                    name,
-                    factory,
+                    job,
                     settings,
                     once=args.once,
                     stop_event=stop_event,
-                ): name
-                for name, factory in jobs
+                ): job
+                for job in jobs
             }
             for future in as_completed(futures):
-                worker_name = futures[future]
+                job = futures[future]
                 try:
                     future.result()
                 except Exception:
                     stop_event.set()
                     raise SystemExit(1)
                 if not args.once:
-                    LOGGER.warning("%s worker exited unexpectedly.", worker_name)
+                    LOGGER.warning("%s worker exited unexpectedly: symbol=%s", job.kind, job.symbol)
                     stop_event.set()
                     break
     except KeyboardInterrupt:

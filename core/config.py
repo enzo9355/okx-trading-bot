@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Iterable
 
 from dotenv import load_dotenv
 
@@ -40,6 +41,25 @@ def _path_env(name: str, default: Path) -> Path:
     return path
 
 
+def _dedupe(values: Iterable[str]) -> tuple[str, ...]:
+    seen = set()
+    result = []
+    for value in values:
+        item = value.strip()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        result.append(item)
+    return tuple(result)
+
+
+def _symbol_list_env(name: str, fallback_name: str, default: str) -> tuple[str, ...]:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        raw = os.getenv(fallback_name, default)
+    return _dedupe(raw.split(","))
+
+
 @dataclass(frozen=True)
 class Settings:
     api_key: str
@@ -49,6 +69,8 @@ class Settings:
     dry_run: bool
     spot_symbol: str
     futures_symbol: str
+    spot_symbols: tuple[str, ...]
+    futures_symbols: tuple[str, ...]
     quote_currency: str
     timeframe: str
     ohlcv_limit: int
@@ -69,14 +91,25 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> "Settings":
+        spot_symbols = _symbol_list_env("SPOT_SYMBOLS", "SPOT_SYMBOL", "BTC/USDT,ETH/USDT,SOL/USDT")
+        futures_symbols = _symbol_list_env(
+            "FUTURES_SYMBOLS",
+            "FUTURES_SYMBOL",
+            "BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT",
+        )
         settings = cls(
             api_key=os.getenv("API_KEY", "").strip(),
             secret_key=os.getenv("SECRET_KEY", "").strip(),
             passphrase=os.getenv("PASSPHRASE", "").strip(),
             sandbox_mode=_bool_env("SANDBOX_MODE", True),
             dry_run=_bool_env("DRY_RUN", False),
-            spot_symbol=os.getenv("SPOT_SYMBOL", "BTC/USDT").strip(),
-            futures_symbol=os.getenv("FUTURES_SYMBOL", "BTC/USDT:USDT").strip(),
+            spot_symbol=os.getenv("SPOT_SYMBOL", spot_symbols[0] if spot_symbols else "BTC/USDT").strip(),
+            futures_symbol=os.getenv(
+                "FUTURES_SYMBOL",
+                futures_symbols[0] if futures_symbols else "BTC/USDT:USDT",
+            ).strip(),
+            spot_symbols=spot_symbols,
+            futures_symbols=futures_symbols,
             quote_currency=os.getenv("QUOTE_CURRENCY", "USDT").strip(),
             timeframe=os.getenv("TIMEFRAME", "1m").strip(),
             ohlcv_limit=_int_env("OHLCV_LIMIT", 50),
@@ -155,3 +188,11 @@ class Settings:
                 f"OHLCV_LIMIT must be at least {min_ohlcv} "
                 f"(max of MA slow+1=21 and RSI_PERIOD+2={self.rsi_period + 2})."
             )
+        if not self.spot_symbols:
+            raise ValueError("SPOT_SYMBOLS must contain at least one symbol.")
+        if not self.futures_symbols:
+            raise ValueError("FUTURES_SYMBOLS must contain at least one symbol.")
+        if any("/" not in symbol for symbol in self.spot_symbols):
+            raise ValueError("Every spot symbol must use ccxt format, for example BTC/USDT.")
+        if any("/" not in symbol for symbol in self.futures_symbols):
+            raise ValueError("Every futures symbol must use ccxt format, for example BTC/USDT:USDT.")

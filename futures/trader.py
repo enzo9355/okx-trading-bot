@@ -14,10 +14,10 @@ Direction = Literal["long", "short"]
 
 
 class FuturesTrader:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, *, symbol: str | None = None) -> None:
         try:
             self.settings = settings
-            self.symbol = settings.futures_symbol
+            self.symbol = symbol or settings.futures_symbol
             self.exchange = create_okx_exchange(settings, "swap")
             self.exchange.load_markets()
             self.risk = RiskManager(settings, self.exchange)
@@ -90,7 +90,8 @@ class FuturesTrader:
 
         signal = self.fetch_signal()
         LOGGER.info(
-            "Futures signal=%s prev_ma5=%.2f prev_ma20=%.2f ma5=%.2f ma20=%.2f rsi=%s",
+            "Futures %s signal=%s prev_ma5=%.2f prev_ma20=%.2f ma5=%.2f ma20=%.2f rsi=%s",
+            self.symbol,
             signal.signal,
             signal.previous_fast,
             signal.previous_slow,
