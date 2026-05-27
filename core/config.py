@@ -62,6 +62,10 @@ class Settings:
     futures_stop_loss_pct: float
     futures_take_profit_pct: float
     state_file: Path
+    # RSI filter params
+    rsi_period: int
+    rsi_overbought: float
+    rsi_oversold: float
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -86,6 +90,9 @@ class Settings:
             futures_stop_loss_pct=_float_env("FUTURES_STOP_LOSS_PCT", 0.0075),
             futures_take_profit_pct=_float_env("FUTURES_TAKE_PROFIT_PCT", 0.015),
             state_file=_path_env("RISK_STATE_FILE", ROOT_DIR / "data" / "risk_state.json"),
+            rsi_period=_int_env("RSI_PERIOD", 14),
+            rsi_overbought=_float_env("RSI_OVERBOUGHT", 70.0),
+            rsi_oversold=_float_env("RSI_OVERSOLD", 30.0),
         )
         settings.validate()
         return settings
@@ -121,7 +128,7 @@ class Settings:
         if not 0 < self.max_position_pct <= 1:
             raise ValueError("RISK_MAX_POSITION_PCT must be between 0 and 1.")
         if not 0 < self.daily_max_loss_pct <= 1:
-            raise ValueError("RISK_DAILY_MAX_LOSS_PCT must be between 0 and 1.")
+            raise ValueError("RISK_DAILY_MAX_LOSS_PCT must be greater than 0 and at most 1.")
         if self.margin_ratio_threshold <= 0:
             raise ValueError("RISK_MARGIN_RATIO_THRESHOLD must be greater than 0.")
         if self.futures_margin_mode != "isolated":
@@ -136,4 +143,15 @@ class Settings:
             raise ValueError("FUTURES_TAKE_PROFIT_PCT must be greater than 0.")
         if self.ohlcv_limit < 21:
             raise ValueError("OHLCV_LIMIT must be at least 21 for MA5/MA20 crossover.")
-
+        if self.rsi_period < 2:
+            raise ValueError("RSI_PERIOD must be at least 2.")
+        if not 50 < self.rsi_overbought <= 100:
+            raise ValueError("RSI_OVERBOUGHT must be between 50 and 100.")
+        if not 0 <= self.rsi_oversold < 50:
+            raise ValueError("RSI_OVERSOLD must be between 0 and 50.")
+        min_ohlcv = max(21, self.rsi_period + 2)
+        if self.ohlcv_limit < min_ohlcv:
+            raise ValueError(
+                f"OHLCV_LIMIT must be at least {min_ohlcv} "
+                f"(max of MA slow+1=21 and RSI_PERIOD+2={self.rsi_period + 2})."
+            )
