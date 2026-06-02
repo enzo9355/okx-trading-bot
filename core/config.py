@@ -170,10 +170,10 @@ class Settings:
             raise ValueError("FUTURES_LEVERAGE must remain fixed at 3.")
         if self.futures_position_mode not in {"net", "long_short"}:
             raise ValueError("FUTURES_POSITION_MODE must be either net or long_short.")
-        if self.futures_stop_loss_pct <= 0:
-            raise ValueError("FUTURES_STOP_LOSS_PCT must be greater than 0.")
-        if self.futures_take_profit_pct <= 0:
-            raise ValueError("FUTURES_TAKE_PROFIT_PCT must be greater than 0.")
+        if self.futures_stop_loss_pct < 0:
+            raise ValueError("FUTURES_STOP_LOSS_PCT must be >= 0 (0 = disabled).")
+        if self.futures_take_profit_pct < 0:
+            raise ValueError("FUTURES_TAKE_PROFIT_PCT must be >= 0 (0 = disabled).")
         if self.ohlcv_limit < 21:
             raise ValueError("OHLCV_LIMIT must be at least 21 for MA5/MA20 crossover.")
         if self.rsi_period < 2:

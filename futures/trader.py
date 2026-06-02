@@ -200,15 +200,18 @@ class FuturesTrader:
         stop_loss, take_profit = self._stop_loss_take_profit(direction, entry_price)
         params: dict[str, Any] = {
             "tdMode": self.settings.futures_margin_mode,
-            "stopLoss": {
+        }
+        # Only attach SL/TP if the pct is non-zero (0 = disabled by user)
+        if stop_loss > 0:
+            params["stopLoss"] = {
                 "type": "market",
                 "triggerPrice": stop_loss,
-            },
-            "takeProfit": {
+            }
+        if take_profit > 0:
+            params["takeProfit"] = {
                 "type": "market",
                 "triggerPrice": take_profit,
-            },
-        }
+            }
         params.update(self._position_mode_params(direction))
 
         if self.settings.dry_run:
@@ -272,14 +275,34 @@ class FuturesTrader:
         return self.exchange.create_order(self.symbol, "market", side, amount, None, params)
 
     def _stop_loss_take_profit(self, direction: Direction, entry_price: float) -> tuple[float, float]:
-        if direction == "long":
-            stop_loss = entry_price * (1 - self.settings.futures_stop_loss_pct)
-            take_profit = entry_price * (1 + self.settings.futures_take_profit_pct)
-        else:
-            stop_loss = entry_price * (1 + self.settings.futures_stop_loss_pct)
-            take_profit = entry_price * (1 - self.settings.futures_take_profit_pct)
+        # Returns (stop_loss, take_profit). A value of 0.0 means the feature is disabled.
+        if self.settings.futures_stop_loss_pct == 0 and self.settings.futures_take_profit_pct == 0:
+            return 0.0, 0.0
 
-        return self._normalize_price(stop_loss), self._normalize_price(take_profit)
+        if direction == "long":
+            stop_loss = (
+                self._normalize_price(entry_price * (1 - self.settings.futures_stop_loss_pct))
+                if self.settings.futures_stop_loss_pct > 0
+                else 0.0
+            )
+            take_profit = (
+                self._normalize_price(entry_price * (1 + self.settings.futures_take_profit_pct))
+                if self.settings.futures_take_profit_pct > 0
+                else 0.0
+            )
+        else:
+            stop_loss = (
+                self._normalize_price(entry_price * (1 + self.settings.futures_stop_loss_pct))
+                if self.settings.futures_stop_loss_pct > 0
+                else 0.0
+            )
+            take_profit = (
+                self._normalize_price(entry_price * (1 - self.settings.futures_take_profit_pct))
+                if self.settings.futures_take_profit_pct > 0
+                else 0.0
+            )
+
+        return stop_loss, take_profit
 
     def _position_mode_params(self, direction: Direction) -> dict[str, Any]:
         if self.settings.futures_position_mode == "long_short":
