@@ -88,6 +88,10 @@ class Settings:
     rsi_period: int
     rsi_overbought: float
     rsi_oversold: float
+    atr_period: int
+    atr_min_pct: float
+    atr_max_pct: float
+    ma_min_trend_slope_pct: float
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -126,6 +130,10 @@ class Settings:
             rsi_period=_int_env("RSI_PERIOD", 14),
             rsi_overbought=_float_env("RSI_OVERBOUGHT", 70.0),
             rsi_oversold=_float_env("RSI_OVERSOLD", 30.0),
+            atr_period=_int_env("ATR_PERIOD", 14),
+            atr_min_pct=_float_env("ATR_MIN_PCT", 0.001),
+            atr_max_pct=_float_env("ATR_MAX_PCT", 0.05),
+            ma_min_trend_slope_pct=_float_env("MA_MIN_TREND_SLOPE_PCT", 0.0001),
         )
         settings.validate()
         return settings
@@ -182,11 +190,20 @@ class Settings:
             raise ValueError("RSI_OVERBOUGHT must be between 50 and 100.")
         if not 0 <= self.rsi_oversold < 50:
             raise ValueError("RSI_OVERSOLD must be between 0 and 50.")
-        min_ohlcv = max(21, self.rsi_period + 2)
+        if self.atr_period < 2:
+            raise ValueError("ATR_PERIOD must be at least 2.")
+        if self.atr_min_pct < 0:
+            raise ValueError("ATR_MIN_PCT must be >= 0.")
+        if self.atr_max_pct <= self.atr_min_pct:
+            raise ValueError("ATR_MAX_PCT must be greater than ATR_MIN_PCT.")
+        if self.ma_min_trend_slope_pct < 0:
+            raise ValueError("MA_MIN_TREND_SLOPE_PCT must be >= 0.")
+        min_ohlcv = max(21, self.rsi_period + 2, self.atr_period + 1)
         if self.ohlcv_limit < min_ohlcv:
             raise ValueError(
                 f"OHLCV_LIMIT must be at least {min_ohlcv} "
-                f"(max of MA slow+1=21 and RSI_PERIOD+2={self.rsi_period + 2})."
+                f"(max of MA slow+1=21, RSI_PERIOD+2={self.rsi_period + 2}, "
+                f"and ATR_PERIOD+1={self.atr_period + 1})."
             )
         if not self.spot_symbols:
             raise ValueError("SPOT_SYMBOLS must contain at least one symbol.")
