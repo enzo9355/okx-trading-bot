@@ -6,7 +6,7 @@ from typing import Any
 from core.config import Settings
 from core.exchange import create_okx_exchange
 from core.risk import RiskLimitError, RiskManager
-from core.strategy import MovingAverageSignal, moving_average_cross_signal_with_rsi
+from core.strategy import MovingAverageSignal, filtered_ma_cross_signal
 
 
 LOGGER = logging.getLogger(__name__)
@@ -23,14 +23,17 @@ class SpotTrader:
     def run_once(self) -> dict[str, Any] | None:
         signal = self.fetch_signal()
         LOGGER.info(
-            "Spot %s signal=%s prev_ma5=%.2f prev_ma20=%.2f ma5=%.2f ma20=%.2f rsi=%s",
+            "Spot %s signal=%s reason=%s prev_ma5=%.2f prev_ma20=%.2f ma5=%.2f ma20=%.2f rsi=%s atr_pct=%s slow_slope_pct=%s",
             self.symbol,
             signal.signal,
+            signal.reason,
             signal.previous_fast,
             signal.previous_slow,
             signal.current_fast,
             signal.current_slow,
             f"{signal.rsi:.2f}" if signal.rsi is not None else "n/a",
+            f"{signal.atr_pct:.4%}" if signal.atr_pct is not None else "n/a",
+            f"{signal.slow_slope_pct:.4%}" if signal.slow_slope_pct is not None else "n/a",
         )
 
         if signal.signal == "hold":
@@ -59,14 +62,22 @@ class SpotTrader:
             timeframe=self.settings.timeframe,
             limit=self.settings.ohlcv_limit,
         )
+        highs = [float(candle[2]) for candle in candles]
+        lows = [float(candle[3]) for candle in candles]
         closes = [float(candle[4]) for candle in candles]
-        return moving_average_cross_signal_with_rsi(
+        return filtered_ma_cross_signal(
+            highs,
+            lows,
             closes,
             fast=5,
             slow=20,
             rsi_period=self.settings.rsi_period,
             rsi_overbought=self.settings.rsi_overbought,
             rsi_oversold=self.settings.rsi_oversold,
+            atr_period=self.settings.atr_period,
+            min_atr_pct=self.settings.atr_min_pct,
+            max_atr_pct=self.settings.atr_max_pct,
+            min_slow_slope_pct=self.settings.ma_min_trend_slope_pct,
         )
 
     def fetch_last_price(self) -> float:
