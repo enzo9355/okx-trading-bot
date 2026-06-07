@@ -15,6 +15,9 @@ class MovingAverageSignal:
     current_fast: float
     current_slow: float
     rsi: float | None = None
+    atr_pct: float | None = None
+    slow_slope_pct: float | None = None
+    reason: str = "ma_cross"
 
 
 def simple_moving_average(values: list[float]) -> float:
@@ -51,6 +54,33 @@ def calculate_rsi(closes: list[float], period: int = 14) -> float:
 
     rs = avg_gain / avg_loss
     return 100.0 - (100.0 / (1.0 + rs))
+
+
+def calculate_atr_pct(highs: list[float], lows: list[float], closes: list[float], period: int = 14) -> float:
+    """Return Average True Range as a percentage of the latest close."""
+    if len(highs) != len(lows) or len(highs) != len(closes):
+        raise ValueError("High, low, and close lists must have the same length.")
+    if len(closes) < period + 1:
+        raise ValueError(f"Need at least {period + 1} candles to calculate ATR({period}).")
+
+    true_ranges = []
+    for index in range(1, len(closes)):
+        high = highs[index]
+        low = lows[index]
+        previous_close = closes[index - 1]
+        true_ranges.append(
+            max(
+                high - low,
+                abs(high - previous_close),
+                abs(low - previous_close),
+            )
+        )
+
+    atr = sum(true_ranges[-period:]) / period
+    latest_close = closes[-1]
+    if latest_close <= 0:
+        raise ValueError("Latest close must be greater than 0 to calculate ATR percentage.")
+    return atr / latest_close
 
 
 def moving_average_cross_signal(closes: list[float], *, fast: int = 5, slow: int = 20) -> MovingAverageSignal:
@@ -102,7 +132,7 @@ def moving_average_cross_signal_with_rsi(
     try:
         rsi = calculate_rsi(closes, period=rsi_period)
     except ValueError:
-        # Not enough data for RSI — fall back to raw MA signal
+        # Not enough data for RSI; fall back to raw MA signal.
         return base
 
     signal: Signal = base.signal
@@ -118,4 +148,69 @@ def moving_average_cross_signal_with_rsi(
         current_fast=base.current_fast,
         current_slow=base.current_slow,
         rsi=rsi,
+        reason="rsi_filter" if signal == "hold" and base.signal != "hold" else base.reason,
+    )
+
+
+def filtered_ma_cross_signal(
+    highs: list[float],
+    lows: list[float],
+    closes: list[float],
+    *,
+    fast: int = 5,
+    slow: int = 20,
+    rsi_period: int = 14,
+    rsi_overbought: float = 70.0,
+    rsi_oversold: float = 30.0,
+    atr_period: int = 14,
+    min_atr_pct: float = 0.001,
+    max_atr_pct: float = 0.05,
+    min_slow_slope_pct: float = 0.0001,
+) -> MovingAverageSignal:
+    """MA crossover with RSI, volatility, and trend-quality filters."""
+    signal = moving_average_cross_signal_with_rsi(
+        closes,
+        fast=fast,
+        slow=slow,
+        rsi_period=rsi_period,
+        rsi_overbought=rsi_overbought,
+        rsi_oversold=rsi_oversold,
+    )
+
+    try:
+        atr_pct = calculate_atr_pct(highs, lows, closes, period=atr_period)
+    except ValueError:
+        atr_pct = None
+
+    slow_slope_pct = None
+    if signal.previous_slow > 0:
+        slow_slope_pct = (signal.current_slow - signal.previous_slow) / signal.previous_slow
+
+    filtered_signal: Signal = signal.signal
+    reason = signal.reason
+    if filtered_signal != "hold" and atr_pct is not None:
+        if atr_pct < min_atr_pct:
+            filtered_signal = "hold"
+            reason = "low_volatility"
+        elif atr_pct > max_atr_pct:
+            filtered_signal = "hold"
+            reason = "high_volatility"
+
+    if filtered_signal == "buy" and slow_slope_pct is not None and slow_slope_pct < min_slow_slope_pct:
+        filtered_signal = "hold"
+        reason = "weak_uptrend"
+    elif filtered_signal == "sell" and slow_slope_pct is not None and slow_slope_pct > -min_slow_slope_pct:
+        filtered_signal = "hold"
+        reason = "weak_downtrend"
+
+    return MovingAverageSignal(
+        signal=filtered_signal,
+        previous_fast=signal.previous_fast,
+        previous_slow=signal.previous_slow,
+        current_fast=signal.current_fast,
+        current_slow=signal.current_slow,
+        rsi=signal.rsi,
+        atr_pct=atr_pct,
+        slow_slope_pct=slow_slope_pct,
+        reason=reason,
     )
