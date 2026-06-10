@@ -93,6 +93,68 @@ class StrategyTest(unittest.TestCase):
         self.assertEqual(signal.signal, "hold")
         self.assertEqual(signal.reason, "weak_uptrend")
 
+    def test_rsi_filter_suppresses_overbought_buy(self) -> None:
+        # 20 flat closes then a jump up => MA5 crosses above MA20 (buy),
+        # but the only up-move makes RSI hit 100 => suppressed as rsi_filter.
+        closes = [10.00] * 20 + [10.10]
+        highs = [close + 0.001 for close in closes]
+        lows = [close - 0.001 for close in closes]
+
+        signal = filtered_ma_cross_signal(
+            highs,
+            lows,
+            closes,
+            rsi_overbought=70,
+            atr_period=14,
+            min_atr_pct=0.0,
+            max_atr_pct=1.0,
+            min_slow_slope_pct=0,
+        )
+
+        self.assertEqual(signal.signal, "hold")
+        self.assertEqual(signal.reason, "rsi_filter")
+
+    def test_high_volatility_filters_cross_signal(self) -> None:
+        # Same buy cross, but very wide candles => large ATR => suppressed.
+        closes = [10.00] * 20 + [10.10]
+        highs = [close + 5.0 for close in closes]
+        lows = [close - 5.0 for close in closes]
+
+        signal = filtered_ma_cross_signal(
+            highs,
+            lows,
+            closes,
+            rsi_overbought=101,  # do not let RSI suppress the buy
+            atr_period=14,
+            min_atr_pct=0.001,
+            max_atr_pct=0.05,
+            min_slow_slope_pct=0,
+        )
+
+        self.assertEqual(signal.signal, "hold")
+        self.assertEqual(signal.reason, "high_volatility")
+
+    def test_weak_slow_ma_slope_filters_downtrend(self) -> None:
+        # 20 flat closes then a drop => MA5 crosses below MA20 (sell),
+        # but the slow MA barely slopes down => suppressed as weak_downtrend.
+        closes = [10.00] * 20 + [9.90]
+        highs = [close + 0.50 for close in closes]
+        lows = [close - 0.50 for close in closes]
+
+        signal = filtered_ma_cross_signal(
+            highs,
+            lows,
+            closes,
+            rsi_oversold=-1,  # do not let RSI suppress the sell
+            atr_period=14,
+            min_atr_pct=0.001,
+            max_atr_pct=0.20,
+            min_slow_slope_pct=0.01,
+        )
+
+        self.assertEqual(signal.signal, "hold")
+        self.assertEqual(signal.reason, "weak_downtrend")
+
 
 if __name__ == "__main__":
     unittest.main()

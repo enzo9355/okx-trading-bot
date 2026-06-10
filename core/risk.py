@@ -10,7 +10,17 @@ from core.config import Settings
 
 
 class RiskLimitError(RuntimeError):
-    """Raised when trading should stop because a configured risk limit is hit."""
+    """Raised when the WHOLE bot should stop because an account-level risk limit
+    is hit (for example the daily maximum loss). Hitting this halts every worker."""
+
+
+class OrderRejected(RuntimeError):
+    """Raised when a SINGLE order cannot be placed (notional too large after
+    precision rounding, amount below the exchange minimum, price temporarily
+    unavailable, etc.). The bot logs it, skips this one order, and keeps running.
+
+    This is deliberately separate from RiskLimitError so that a per-order problem
+    on one symbol never takes the entire bot (all symbols, spot + futures) offline."""
 
 
 _STATE_LOCK = threading.Lock()
@@ -40,8 +50,13 @@ class RiskManager:
     def assert_order_notional(self, notional: float, equity: float | None = None) -> None:
         equity = equity if equity is not None else self.assert_can_trade()
         max_notional = self.max_order_notional(equity)
-        if notional > max_notional:
-            raise RiskLimitError(
+        # The sized amount is rounded to the exchange's precision before the order
+        # is sent, which can nudge `amount * price` a hair above max_notional even
+        # when it was sized to be exactly equal. Allow a tiny relative tolerance so
+        # that this rounding dust does not reject (and previously crash) the order.
+        tolerance = max(max_notional * 1e-3, 1e-8)
+        if notional > max_notional + tolerance:
+            raise OrderRejected(
                 f"Order notional {notional:.4f} exceeds max allowed {max_notional:.4f} "
                 f"({self.settings.max_position_pct:.2%} of equity)."
             )
@@ -52,14 +67,14 @@ class RiskManager:
 
     def amount_for_price(self, price: float, equity: float | None = None) -> float:
         if price <= 0:
-            raise RiskLimitError("Cannot size a position because price is not greater than 0.")
+            raise OrderRejected("Cannot size a position because price is not greater than 0.")
         return self.max_order_notional(equity) / price
 
     def fetch_equity(self) -> float:
         balance = self.exchange.fetch_balance()
         equity = self.extract_equity(balance, self.settings.quote_currency)
         if equity is None or equity <= 0:
-            raise RiskLimitError("Unable to read a positive account equity from OKX balance.")
+            raise OrderRejected("Unable to read a positive account equity from OKX balance.")
         return equity
 
     def fetch_margin_ratio(self) -> float | None:

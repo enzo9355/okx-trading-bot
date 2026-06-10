@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Any
 
 from core.config import Settings
 from core.exchange import create_okx_exchange
-from core.risk import RiskLimitError, RiskManager
+from core.risk import OrderRejected, RiskLimitError, RiskManager
 from core.strategy import MovingAverageSignal, filtered_ma_cross_signal
+from core.trade_logger import TradeLogger
 
 
 LOGGER = logging.getLogger(__name__)
@@ -19,6 +21,7 @@ class SpotTrader:
         self.exchange = create_okx_exchange(settings, "spot")
         self.exchange.load_markets()
         self.risk = RiskManager(settings, self.exchange)
+        self.trade_logger = TradeLogger(settings.trade_log_file)
 
     def run_once(self) -> dict[str, Any] | None:
         signal = self.fetch_signal()
@@ -45,7 +48,9 @@ class SpotTrader:
 
         if signal.signal == "buy":
             self.risk.assert_order_notional(amount * price, equity)
-            return self.create_market_order("buy", amount)
+            order = self.create_market_order("buy", amount)
+            self._record_trade(signal, "buy", amount, price, order)
+            return order
 
         base_free = self.fetch_base_free_balance()
         sell_amount = min(base_free, amount)
@@ -54,7 +59,37 @@ class SpotTrader:
             return None
 
         self.risk.assert_order_notional(sell_amount * price, equity)
-        return self.create_market_order("sell", sell_amount)
+        order = self.create_market_order("sell", sell_amount)
+        self._record_trade(signal, "sell", sell_amount, price, order)
+        return order
+
+    def _record_trade(
+        self,
+        signal: MovingAverageSignal,
+        side: str,
+        amount: float,
+        price: float,
+        order: dict[str, Any] | None,
+    ) -> None:
+        order_id = ""
+        if isinstance(order, dict):
+            order_id = order.get("id") or ("dry_run" if order.get("dryRun") else "")
+        self.trade_logger.record(
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            market="spot",
+            symbol=self.symbol,
+            side=side,
+            reason=signal.reason,
+            amount=amount,
+            price=price,
+            notional=amount * price,
+            rsi=signal.rsi,
+            atr_pct=signal.atr_pct,
+            slow_slope_pct=signal.slow_slope_pct,
+            order_id=order_id,
+            sandbox=self.settings.sandbox_mode,
+            dry_run=self.settings.dry_run,
+        )
 
     def fetch_signal(self) -> MovingAverageSignal:
         candles = self.exchange.fetch_ohlcv(
@@ -84,7 +119,7 @@ class SpotTrader:
         ticker = self.exchange.fetch_ticker(self.symbol)
         price = ticker.get("last") or ticker.get("close")
         if price is None:
-            raise RiskLimitError(f"Unable to fetch last price for {self.symbol}.")
+            raise OrderRejected(f"Unable to fetch last price for {self.symbol}.")
         return float(price)
 
     def fetch_base_free_balance(self) -> float:
@@ -144,9 +179,9 @@ class SpotTrader:
         normalized = float(self.exchange.amount_to_precision(self.symbol, amount))
         min_amount = ((self.exchange.market(self.symbol).get("limits") or {}).get("amount") or {}).get("min")
         if min_amount is not None and normalized < float(min_amount):
-            raise RiskLimitError(f"Spot amount {normalized} is below exchange min amount {min_amount}.")
+            raise OrderRejected(f"Spot amount {normalized} is below exchange min amount {min_amount}.")
         if normalized <= 0:
-            raise RiskLimitError("Spot amount must be greater than 0 after precision normalization.")
+            raise OrderRejected("Spot amount must be greater than 0 after precision normalization.")
         return normalized
 
     def _normalize_price(self, price: float | None) -> float | None:
@@ -154,5 +189,5 @@ class SpotTrader:
             return None
         normalized = float(self.exchange.price_to_precision(self.symbol, price))
         if normalized <= 0:
-            raise RiskLimitError("Spot price must be greater than 0 after precision normalization.")
+            raise OrderRejected("Spot price must be greater than 0 after precision normalization.")
         return normalized

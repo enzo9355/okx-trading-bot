@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Any, Literal
 
 from core.config import Settings
 from core.exchange import create_okx_exchange
-from core.risk import RiskLimitError, RiskManager
+from core.risk import OrderRejected, RiskLimitError, RiskManager
 from core.strategy import MovingAverageSignal, filtered_ma_cross_signal
+from core.trade_logger import TradeLogger
 
 
 LOGGER = logging.getLogger(__name__)
@@ -21,6 +23,7 @@ class FuturesTrader:
             self.exchange = create_okx_exchange(settings, "swap")
             self.exchange.load_markets()
             self.risk = RiskManager(settings, self.exchange)
+            self.trade_logger = TradeLogger(settings.trade_log_file)
             self.configure_margin_and_leverage()
         except Exception:
             LOGGER.exception("Futures trader initialization failed.")
@@ -115,13 +118,45 @@ class FuturesTrader:
             if self.has_open_position("long"):
                 LOGGER.info("Long position already open; skipping duplicate long entry.")
                 return None
-            return self.open_long(contracts, price)
+            order = self.open_long(contracts, price)
+            self._record_trade(signal, "long", contracts, price, order)
+            return order
 
         self.close_positions_by_direction("long")
         if self.has_open_position("short"):
             LOGGER.info("Short position already open; skipping duplicate short entry.")
             return None
-        return self.open_short(contracts, price)
+        order = self.open_short(contracts, price)
+        self._record_trade(signal, "short", contracts, price, order)
+        return order
+
+    def _record_trade(
+        self,
+        signal: MovingAverageSignal,
+        side: str,
+        contracts: float,
+        price: float,
+        order: dict[str, Any] | None,
+    ) -> None:
+        order_id = ""
+        if isinstance(order, dict):
+            order_id = order.get("id") or ("dry_run" if order.get("dryRun") else "")
+        self.trade_logger.record(
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            market="futures",
+            symbol=self.symbol,
+            side=side,
+            reason=signal.reason,
+            amount=contracts,
+            price=price,
+            notional="",  # futures notional depends on contract size; left blank
+            rsi=signal.rsi,
+            atr_pct=signal.atr_pct,
+            slow_slope_pct=signal.slow_slope_pct,
+            order_id=order_id,
+            sandbox=self.settings.sandbox_mode,
+            dry_run=self.settings.dry_run,
+        )
 
     def fetch_signal(self) -> MovingAverageSignal:
         candles = self.exchange.fetch_ohlcv(
@@ -151,7 +186,7 @@ class FuturesTrader:
         ticker = self.exchange.fetch_ticker(self.symbol)
         price = ticker.get("last") or ticker.get("close")
         if price is None:
-            raise RiskLimitError(f"Unable to fetch last price for {self.symbol}.")
+            raise OrderRejected(f"Unable to fetch last price for {self.symbol}.")
         return float(price)
 
     def open_long(self, contracts: float, entry_price: float | None = None) -> dict[str, Any]:
@@ -200,7 +235,7 @@ class FuturesTrader:
         market = self.exchange.market(self.symbol)
         contract_size = float(market.get("contractSize") or 1)
         if price <= 0 or contract_size <= 0:
-            raise RiskLimitError("Cannot calculate futures contracts from invalid price or contract size.")
+            raise OrderRejected("Cannot calculate futures contracts from invalid price or contract size.")
 
         raw_contracts = notional / (price * contract_size)
         contracts = self._normalize_amount(raw_contracts)
@@ -341,15 +376,15 @@ class FuturesTrader:
         normalized = float(self.exchange.amount_to_precision(self.symbol, amount))
         min_amount = ((self.exchange.market(self.symbol).get("limits") or {}).get("amount") or {}).get("min")
         if min_amount is not None and normalized < float(min_amount):
-            raise RiskLimitError(f"Futures amount {normalized} is below exchange min amount {min_amount}.")
+            raise OrderRejected(f"Futures amount {normalized} is below exchange min amount {min_amount}.")
         if normalized <= 0:
-            raise RiskLimitError("Futures amount must be greater than 0 after precision normalization.")
+            raise OrderRejected("Futures amount must be greater than 0 after precision normalization.")
         return normalized
 
     def _normalize_price(self, price: float) -> float:
         normalized = float(self.exchange.price_to_precision(self.symbol, price))
         if normalized <= 0:
-            raise RiskLimitError("Futures price must be greater than 0 after precision normalization.")
+            raise OrderRejected("Futures price must be greater than 0 after precision normalization.")
         return normalized
 
     @staticmethod

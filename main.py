@@ -10,7 +10,7 @@ from time import monotonic
 from typing import Callable
 
 from core.config import Settings
-from core.risk import RiskLimitError
+from core.risk import OrderRejected, RiskLimitError
 from futures.trader import FuturesTrader
 from spot.trader import SpotTrader
 
@@ -66,7 +66,12 @@ def run_loop(
             started = monotonic()
             try:
                 trader.run_once()
+            except OrderRejected as exc:
+                # A single order could not be placed (rounding, min size, transient
+                # API hiccup). Skip just this order and keep the worker running.
+                LOGGER.info("%s order skipped: symbol=%s reason=%s", kind, symbol, exc)
             except RiskLimitError as exc:
+                # An account-level limit (e.g. daily max loss) was hit. Stop everything.
                 LOGGER.error("%s trader stopped by risk control: symbol=%s error=%s", kind, symbol, exc)
                 stop_event.set()
                 return
