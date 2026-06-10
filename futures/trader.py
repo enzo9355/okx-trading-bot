@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import logging
+import random
+import time
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Any, Callable, Literal, TypeVar
+
+import ccxt
 
 from core.config import Settings
 from core.exchange import create_okx_exchange
@@ -13,6 +17,54 @@ from core.trade_logger import TradeLogger
 
 LOGGER = logging.getLogger(__name__)
 Direction = Literal["long", "short"]
+T = TypeVar("T")
+
+# When several futures workers start at the same time (e.g. systemd restart, or
+# `--mode both` spinning up 5 symbols at once) they each call set_position_mode /
+# set_margin_mode / set_leverage on OKX in lockstep, which trips OKX's rate limit
+# (error code 50011 "Too Many Requests") and crashes the worker. systemd then
+# restarts immediately, hitting the same wall, producing a restart storm.
+# These two helpers stagger startup and retry rate-limited setup calls.
+
+_RATE_LIMIT_RETRIES = 5
+_RATE_LIMIT_BACKOFF_BASE_SECS = 2.0
+_STARTUP_JITTER_MAX_SECS = 4.0
+
+
+def _is_rate_limit_error(exc: BaseException) -> bool:
+    """True if the exception looks like an OKX 50011 'Too Many Requests' error."""
+    if isinstance(exc, ccxt.RateLimitExceeded):
+        return True
+    text = str(exc)
+    return "50011" in text or "Too Many Requests" in text
+
+
+def _retry_on_rate_limit(operation: str, func: Callable[[], T]) -> T:
+    """Call `func()`; if OKX returns a rate-limit error, wait and retry with
+    exponential backoff. Only rate-limit errors are retried — any other error
+    propagates immediately."""
+    last_exc: BaseException | None = None
+    for attempt in range(1, _RATE_LIMIT_RETRIES + 1):
+        try:
+            return func()
+        except Exception as exc:  # noqa: BLE001 — narrowed by _is_rate_limit_error
+            if not _is_rate_limit_error(exc):
+                raise
+            last_exc = exc
+            if attempt == _RATE_LIMIT_RETRIES:
+                break
+            wait_secs = _RATE_LIMIT_BACKOFF_BASE_SECS * (2 ** (attempt - 1))
+            wait_secs += random.uniform(0, 1.0)  # jitter so retries don't sync
+            LOGGER.warning(
+                "OKX rate limit hit during %s (attempt %d/%d), waiting %.1fs...",
+                operation,
+                attempt,
+                _RATE_LIMIT_RETRIES,
+                wait_secs,
+            )
+            time.sleep(wait_secs)
+    assert last_exc is not None
+    raise last_exc
 
 
 class FuturesTrader:
@@ -44,10 +96,20 @@ class FuturesTrader:
             )
             return
 
+        # Random startup jitter so that when N futures workers all spin up at the
+        # same instant, they don't all hammer set_position_mode / set_margin_mode /
+        # set_leverage on OKX in the same millisecond. Spreads the bursts out.
+        jitter = random.uniform(0, _STARTUP_JITTER_MAX_SECS)
+        LOGGER.info("Futures startup jitter for %s: sleeping %.2fs", self.symbol, jitter)
+        time.sleep(jitter)
+
         try:
             hedged = self.settings.futures_position_mode == "long_short"
             LOGGER.info("Setting futures position mode: hedged=%s", hedged)
-            self.exchange.set_position_mode(hedged)
+            _retry_on_rate_limit(
+                f"set_position_mode({self.symbol})",
+                lambda: self.exchange.set_position_mode(hedged),
+            )
 
             for pos_side in position_sides:
                 margin_params = self._margin_mode_params(pos_side, leverage)
@@ -59,7 +121,10 @@ class FuturesTrader:
                     margin_mode,
                     pos_side,
                 )
-                self.exchange.set_margin_mode(margin_mode, self.symbol, margin_params)
+                _retry_on_rate_limit(
+                    f"set_margin_mode({self.symbol})",
+                    lambda mp=margin_params: self.exchange.set_margin_mode(margin_mode, self.symbol, mp),
+                )
 
                 LOGGER.info(
                     "Setting futures leverage: symbol=%s leverage=%sx margin=%s posSide=%s",
@@ -68,7 +133,10 @@ class FuturesTrader:
                     margin_mode,
                     pos_side,
                 )
-                self.exchange.set_leverage(leverage, self.symbol, leverage_params)
+                _retry_on_rate_limit(
+                    f"set_leverage({self.symbol})",
+                    lambda lp=leverage_params: self.exchange.set_leverage(leverage, self.symbol, lp),
+                )
         except Exception:
             LOGGER.exception(
                 "Futures margin/leverage configuration failed: symbol=%s margin=%s "
