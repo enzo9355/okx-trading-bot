@@ -93,6 +93,12 @@ class Settings:
     atr_min_pct: float
     atr_max_pct: float
     ma_min_trend_slope_pct: float
+    # Risk hardening
+    spot_stop_loss_pct: float
+    max_open_positions: int
+    stop_out_cooldown_seconds: int
+    max_order_notional_usdt: float
+    position_registry_file: Path
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -136,6 +142,11 @@ class Settings:
             atr_min_pct=_float_env("ATR_MIN_PCT", 0.001),
             atr_max_pct=_float_env("ATR_MAX_PCT", 0.05),
             ma_min_trend_slope_pct=_float_env("MA_MIN_TREND_SLOPE_PCT", 0.0001),
+            spot_stop_loss_pct=_float_env("SPOT_STOP_LOSS_PCT", 0.02),
+            max_open_positions=_int_env("MAX_OPEN_POSITIONS", 3),
+            stop_out_cooldown_seconds=_int_env("STOP_OUT_COOLDOWN_SECONDS", 900),
+            max_order_notional_usdt=_float_env("MAX_ORDER_NOTIONAL_USDT", 0.0),
+            position_registry_file=_path_env("POSITION_REGISTRY_FILE", ROOT_DIR / "data" / "positions.json"),
         )
         settings.validate()
         return settings
@@ -200,6 +211,14 @@ class Settings:
             raise ValueError("ATR_MAX_PCT must be greater than ATR_MIN_PCT.")
         if self.ma_min_trend_slope_pct < 0:
             raise ValueError("MA_MIN_TREND_SLOPE_PCT must be >= 0.")
+        if self.spot_stop_loss_pct < 0:
+            raise ValueError("SPOT_STOP_LOSS_PCT must be >= 0 (0 = disabled).")
+        if self.max_open_positions < 1:
+            raise ValueError("MAX_OPEN_POSITIONS must be at least 1.")
+        if self.stop_out_cooldown_seconds < 0:
+            raise ValueError("STOP_OUT_COOLDOWN_SECONDS must be >= 0 (0 = disabled).")
+        if self.max_order_notional_usdt < 0:
+            raise ValueError("MAX_ORDER_NOTIONAL_USDT must be >= 0 (0 = disabled).")
         min_ohlcv = max(21, self.rsi_period + 2, self.atr_period + 1)
         if self.ohlcv_limit < min_ohlcv:
             raise ValueError(

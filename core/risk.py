@@ -60,6 +60,14 @@ class RiskManager:
                 f"Order notional {notional:.4f} exceeds max allowed {max_notional:.4f} "
                 f"({self.settings.max_position_pct:.2%} of equity)."
             )
+        # Optional absolute cap in quote currency. Unlike the % cap, this does not
+        # grow with equity — it is a hard ceiling per order regardless of account
+        # size. 0 disables it.
+        hard_cap = self.settings.max_order_notional_usdt
+        if hard_cap > 0 and notional > hard_cap:
+            raise OrderRejected(
+                f"Order notional {notional:.4f} exceeds hard cap MAX_ORDER_NOTIONAL_USDT={hard_cap:.2f}."
+            )
 
     def max_order_notional(self, equity: float | None = None) -> float:
         equity = equity if equity is not None else self.fetch_equity()

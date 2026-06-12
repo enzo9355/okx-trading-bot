@@ -34,6 +34,29 @@ log 會顯示 `reason`，方便你理解為什麼交易或不交易：
 - 合約會檢查 margin ratio，低於門檻時嘗試平倉。
 - 每日風控狀態寫入 `data/risk_state.json`。
 - 單筆訂單若因精度進位、低於交易所最小量或暫時抓不到價格而無法送出，bot 只會跳過該筆並繼續運作，不會整台停機。只有「每日最大虧損」這類帳戶層級的限制才會讓整台 bot 停止。
+- **現貨停損**：bot 自己買入的現貨部位，若價格跌破加權平均進場價的 `SPOT_STOP_LOSS_PCT`（預設 2%），每個交易週期檢查一次並市價出場。只賣 bot 自己開的量，不動你原本的持倉。
+- **最大同時持倉數**：現貨 + 合約合計超過 `MAX_OPEN_POSITIONS`（預設 3）就不再開新倉，避免在趨勢行情中對高度相關的幣種過度曝險。
+- **停損後冷卻**：任何停損出場（含合約交易所端 SL 觸發）後，同一交易對 `STOP_OUT_COOLDOWN_SECONDS`（預設 15 分鐘）內不再進場，避免報復性交易。
+- **單筆金額硬上限**：`MAX_ORDER_NOTIONAL_USDT` 設大於 0 時，單筆訂單金額不得超過此 USDT 值，與 % 上限獨立（0 = 停用）。
+- 持倉與冷卻狀態存於 `data/positions.json`，重啟不會遺失。
+
+
+## 回測
+
+[#回測](#回測)
+
+`backtest/` 模組用與實盤完全相同的訊號函式重放歷史 K 線（OKX 公開行情，不需 API key）：
+
+```bash
+.venv/bin/python -m backtest.run --symbol BTC/USDT --timeframe 15m --days 30
+.venv/bin/python -m backtest.run --symbol BTC/USDT --timeframe 1m --days 7 --stop-loss 0.02
+```
+
+輸出包含交易次數、勝率、策略報酬、**買入持有基準**、最大回撤與手續費成本。改任何策略參數前先回測，並與買入持有比較——跑輸持有就是在白繳手續費。
+
+另外兩個工具：
+- `scripts/report.py`：把 `data/trades.csv` 配對成完整進出場回合，計算實際勝率與毛損益。
+- `scripts/verify_sl_attachment.py`：在模擬倉下一筆極小實單，驗證合約停損真的有掛到 OKX 伺服器上（上真錢前必跑）。
 
 
 ## 交易紀錄

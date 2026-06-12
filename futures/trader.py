@@ -10,6 +10,7 @@ import ccxt
 
 from core.config import Settings
 from core.exchange import create_okx_exchange
+from core.position_registry import PositionRegistry
 from core.risk import OrderRejected, RiskLimitError, RiskManager
 from core.strategy import MovingAverageSignal, filtered_ma_cross_signal
 from core.trade_logger import TradeLogger
@@ -76,6 +77,7 @@ class FuturesTrader:
             self.exchange.load_markets()
             self.risk = RiskManager(settings, self.exchange)
             self.trade_logger = TradeLogger(settings.trade_log_file)
+            self.positions = PositionRegistry(settings.position_registry_file)
             self.configure_margin_and_leverage()
         except Exception:
             LOGGER.exception("Futures trader initialization failed.")
@@ -174,6 +176,8 @@ class FuturesTrader:
             f"{signal.slow_slope_pct:.4%}" if signal.slow_slope_pct is not None else "n/a",
         )
 
+        self._reconcile_stop_outs(signal)
+
         if signal.signal == "hold":
             return None
 
@@ -182,21 +186,86 @@ class FuturesTrader:
         contracts = self.contracts_for_notional(self.risk.max_order_notional(equity), price)
 
         if signal.signal == "buy":
-            self.close_positions_by_direction("short")
+            closed = self.close_positions_by_direction("short")
+            if closed:
+                self.positions.record_close("futures", self.symbol)
+                self._record_trade(signal, "close_short", contracts, price, closed[-1], reason="signal_flip")
             if self.has_open_position("long"):
                 LOGGER.info("Long position already open; skipping duplicate long entry.")
                 return None
+            if not self._entry_allowed():
+                return None
             order = self.open_long(contracts, price)
+            self.positions.record_open("futures", self.symbol, "long", contracts, price)
             self._record_trade(signal, "long", contracts, price, order)
             return order
 
-        self.close_positions_by_direction("long")
+        closed = self.close_positions_by_direction("long")
+        if closed:
+            self.positions.record_close("futures", self.symbol)
+            self._record_trade(signal, "close_long", contracts, price, closed[-1], reason="signal_flip")
         if self.has_open_position("short"):
             LOGGER.info("Short position already open; skipping duplicate short entry.")
             return None
+        if not self._entry_allowed():
+            return None
         order = self.open_short(contracts, price)
+        self.positions.record_open("futures", self.symbol, "short", contracts, price)
         self._record_trade(signal, "short", contracts, price, order)
         return order
+
+    def _entry_allowed(self) -> bool:
+        """Gate new futures entries on the stop-out cooldown and the global
+        max-open-positions cap (shared with spot via the registry file)."""
+        if self.positions.in_cooldown("futures", self.symbol):
+            LOGGER.info("Futures %s entry skipped: in post-stop-out cooldown.", self.symbol)
+            return False
+        if (
+            not self.positions.has_position("futures", self.symbol)
+            and self.positions.open_count() >= self.settings.max_open_positions
+        ):
+            LOGGER.info(
+                "Futures %s entry skipped: max open positions reached (%d).",
+                self.symbol,
+                self.settings.max_open_positions,
+            )
+            return False
+        return True
+
+    def _reconcile_stop_outs(self, signal: MovingAverageSignal) -> None:
+        """Detect exchange-side stop-loss/take-profit fills.
+
+        The futures SL/TP execute on OKX's servers, so the bot only learns about
+        them by noticing the position is gone. When the registry says we have a
+        position but the exchange says we don't, infer a stop-out (or TP fill),
+        log it, clear the registry entry, and start the cooldown so the very
+        next cross signal can't immediately revenge-enter the same symbol.
+        """
+        if self.settings.dry_run:
+            return
+        registered = self.positions.get("futures", self.symbol)
+        if not registered:
+            return
+        side = str(registered.get("side"))
+        if side in ("long", "short") and not self.has_open_position(side):  # type: ignore[arg-type]
+            LOGGER.warning(
+                "Futures %s %s position closed on exchange (stop-loss/take-profit fill inferred). "
+                "Starting %ds cooldown.",
+                self.symbol,
+                side,
+                self.settings.stop_out_cooldown_seconds,
+            )
+            price = self.fetch_last_price()
+            self._record_trade(
+                signal,
+                f"close_{side}",
+                float(registered.get("amount") or 0),
+                price,
+                None,
+                reason="stop_out",
+            )
+            self.positions.record_close("futures", self.symbol)
+            self.positions.set_cooldown("futures", self.symbol, self.settings.stop_out_cooldown_seconds)
 
     def _record_trade(
         self,
@@ -205,6 +274,8 @@ class FuturesTrader:
         contracts: float,
         price: float,
         order: dict[str, Any] | None,
+        *,
+        reason: str | None = None,
     ) -> None:
         order_id = ""
         if isinstance(order, dict):
@@ -214,7 +285,7 @@ class FuturesTrader:
             market="futures",
             symbol=self.symbol,
             side=side,
-            reason=signal.reason,
+            reason=reason or signal.reason,
             amount=contracts,
             price=price,
             notional="",  # futures notional depends on contract size; left blank

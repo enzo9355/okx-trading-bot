@@ -31,6 +31,14 @@ class RiskNotionalTest(unittest.TestCase):
         with self.assertRaises(OrderRejected):
             self.risk.assert_order_notional(60.0, equity=1000.0)
 
+    def test_hard_usdt_cap_rejects_independently_of_equity(self) -> None:
+        settings = replace(_settings_with_tmp_state(), max_order_notional_usdt=30.0)
+        risk = RiskManager(settings, exchange=None)
+        # 5% of 1000 = 50 allowed by %, but the 30 USDT hard cap rejects 40.
+        with self.assertRaises(OrderRejected):
+            risk.assert_order_notional(40.0, equity=1000.0)
+        risk.assert_order_notional(25.0, equity=1000.0)  # under both caps: OK
+
 
 class ExceptionSeparationTest(unittest.TestCase):
     def test_order_rejected_is_not_a_risk_limit_error(self) -> None:
