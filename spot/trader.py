@@ -23,7 +23,10 @@ class SpotTrader:
         self.exchange.load_markets()
         self.risk = RiskManager(settings, self.exchange)
         self.trade_logger = TradeLogger(settings.trade_log_file)
-        self.positions = PositionRegistry(settings.position_registry_file)
+        self.positions = PositionRegistry.for_mode(
+            settings.position_registry_file,
+            dry_run=settings.dry_run,
+        )
 
     def run_once(self) -> dict[str, Any] | None:
         signal = self.fetch_signal()
@@ -41,48 +44,64 @@ class SpotTrader:
             f"{signal.slow_slope_pct:.4%}" if signal.slow_slope_pct is not None else "n/a",
         )
 
+        # A protective exit has priority over every strategy signal. In
+        # particular, a transient buy signal must not bypass a breached stop and
+        # immediately increase the same position.
+        if self._check_stop_loss(signal):
+            return None
+
         if signal.signal == "hold":
-            # Even with no signal, an open position still needs its stop checked.
-            self._check_stop_loss(signal)
             return None
 
         price = self.fetch_last_price()
-        equity = self.risk.assert_can_trade()
-        amount = self.risk.amount_for_price(price, equity)
 
         if signal.signal == "buy":
             if self.positions.in_cooldown("spot", self.symbol):
                 LOGGER.info("Spot %s buy skipped: in post-stop-out cooldown.", self.symbol)
                 return None
-            if (
-                not self.positions.has_position("spot", self.symbol)
-                and self.positions.open_count() >= self.settings.max_open_positions
-            ):
-                LOGGER.info(
-                    "Spot %s buy skipped: max open positions reached (%d).",
-                    self.symbol,
-                    self.settings.max_open_positions,
-                )
-                return None
+            equity = self.risk.assert_can_trade()
+            amount = self.risk.amount_for_price(price, equity)
             self.risk.assert_order_notional(amount * price, equity)
-            order = self.create_market_order("buy", amount)
-            self.positions.record_open("spot", self.symbol, "long", amount, price)
-            self._record_trade(signal, "buy", amount, price, order)
-            return order
+            with self.positions.entry_slot(
+                "spot",
+                self.symbol,
+                self.settings.max_open_positions,
+            ) as allowed:
+                if not allowed:
+                    LOGGER.info(
+                        "Spot %s buy skipped: max open positions reached (%d).",
+                        self.symbol,
+                        self.settings.max_open_positions,
+                    )
+                    return None
+                order = self.create_market_order("buy", amount)
+                filled, average = self._execution_details(order, amount, price)
+                self.positions.record_open("spot", self.symbol, "long", filled, average)
+                self._record_trade(signal, "buy", filled, average, order)
+                return order
 
+        position = self.positions.get("spot", self.symbol)
+        if not position:
+            LOGGER.info(
+                "Spot %s sell skipped: registry has no bot-opened position; wallet holdings are untouched.",
+                self.symbol,
+            )
+            return None
         base_free = self.fetch_base_free_balance()
-        sell_amount = min(base_free, amount)
+        sell_amount = min(base_free, float(position["amount"]))
         if sell_amount <= 0:
             LOGGER.info("Spot sell skipped because there is no free %s balance.", self.base_currency)
             return None
 
-        self.risk.assert_order_notional(sell_amount * price, equity)
+        # This is a risk-reducing exit. Entry caps and the daily-loss circuit
+        # breaker must never prevent the bot from closing its own position.
         order = self.create_market_order("sell", sell_amount)
-        self.positions.record_reduce("spot", self.symbol, sell_amount)
-        self._record_trade(signal, "sell", sell_amount, price, order)
+        filled, average = self._execution_details(order, sell_amount, price)
+        self.positions.record_reduce("spot", self.symbol, filled)
+        self._record_trade(signal, "sell", filled, average, order)
         return order
 
-    def _check_stop_loss(self, signal: MovingAverageSignal) -> None:
+    def _check_stop_loss(self, signal: MovingAverageSignal) -> bool:
         """Hard stop for bot-opened spot positions.
 
         The futures side has an exchange-attached stop; spot previously had NO
@@ -95,17 +114,21 @@ class SpotTrader:
         realized stop price can be worse than the configured level in a fast
         crash. That is still categorically safer than no stop. Only sells the
         registered (bot-opened) amount — never pre-existing wallet holdings.
+
+        Returns True once a breached stop has been handled, even if no free
+        balance was available. The caller must not process another signal in the
+        same cycle after a stop-out decision.
         """
         if self.settings.spot_stop_loss_pct <= 0:
-            return
+            return False
         position = self.positions.get("spot", self.symbol)
         if not position:
-            return
+            return False
         entry = float(position["entry_price"])
         stop_price = entry * (1 - self.settings.spot_stop_loss_pct)
         price = self.fetch_last_price()
         if price > stop_price:
-            return
+            return False
 
         base_free = self.fetch_base_free_balance()
         sell_amount = min(base_free, float(position["amount"]))
@@ -119,9 +142,33 @@ class SpotTrader:
         )
         if sell_amount > 0:
             order = self.create_market_order("sell", sell_amount)
-            self._record_trade(signal, "sell", sell_amount, price, order, reason="stop_loss")
-        self.positions.record_close("spot", self.symbol)
+            filled, average = self._execution_details(order, sell_amount, price)
+            self._record_trade(signal, "sell", filled, average, order, reason="stop_loss")
+            self.positions.record_reduce("spot", self.symbol, filled)
+        else:
+            # No asset remains available to sell, so the stale bot position must
+            # not keep triggering the same stop forever.
+            self.positions.record_close("spot", self.symbol)
         self.positions.set_cooldown("spot", self.symbol, self.settings.stop_out_cooldown_seconds)
+        return True
+
+    @staticmethod
+    def _execution_details(
+        order: dict[str, Any] | None,
+        fallback_amount: float,
+        fallback_price: float,
+    ) -> tuple[float, float]:
+        """Use exchange-confirmed fills for registry and audit records.
+
+        Requested market-order size can differ from the filled size because of
+        precision, partial fills, or fees. Falling back keeps dry-run and sparse
+        exchange responses usable without overstating a known fill.
+        """
+        if not isinstance(order, dict):
+            return fallback_amount, fallback_price
+        amount = float(order.get("filled") or order.get("amount") or fallback_amount)
+        price = float(order.get("average") or order.get("price") or fallback_price)
+        return amount, price
 
     def _record_trade(
         self,

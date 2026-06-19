@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import json
-import logging
+import os
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
-LOGGER = logging.getLogger(__name__)
+from core.risk import RiskLimitError
 
 # One lock for the whole process: spot and futures workers share one registry file.
-_REGISTRY_LOCK = threading.Lock()
+_REGISTRY_LOCK = threading.RLock()
 
 # Positions smaller than this fraction of their original size are treated as closed
 # (precision rounding leaves dust after sells).
@@ -35,6 +36,32 @@ class PositionRegistry:
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
+
+    @classmethod
+    def for_mode(cls, path: str | Path, *, dry_run: bool) -> "PositionRegistry":
+        """Keep simulated positions physically separate from executable ones.
+
+        A dry-run record must never become a sellable live position after the
+        operator switches modes, otherwise a simulated stop could sell assets
+        that the bot did not buy.
+        """
+        resolved = Path(path)
+        if dry_run:
+            resolved = resolved.with_name(f"{resolved.stem}.dry-run{resolved.suffix}")
+        return cls(resolved)
+
+    @contextmanager
+    def entry_slot(self, market: str, symbol: str, max_open_positions: int) -> Iterator[bool]:
+        """Serialize the capacity check with order placement and registration.
+
+        Correlated symbols can signal in different worker threads at the same
+        instant. Holding the process-wide registry lock across this short entry
+        transaction prevents every worker from observing the same last free slot.
+        """
+        key = self._key(market, symbol)
+        with _REGISTRY_LOCK:
+            positions = self._load().get("positions", {})
+            yield key in positions or len(positions) < max_open_positions
 
     # ── position lifecycle ────────────────────────────────────────────────
 
@@ -145,14 +172,32 @@ class PositionRegistry:
         if not self.path.exists():
             return {}
         try:
-            return json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            LOGGER.warning("Position registry file unreadable; starting from empty state.")
-            return {}
+            state = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RiskLimitError(
+                f"Position registry {self.path} is unreadable; refusing to trade."
+            ) from exc
+        if not isinstance(state, dict):
+            raise RiskLimitError(
+                f"Position registry {self.path} has an invalid root value; refusing to trade."
+            )
+        return state
 
     def _save(self, state: dict[str, Any]) -> None:
+        """Atomically replace the registry so a crash cannot leave partial JSON."""
+        temporary = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+            with temporary.open("w", encoding="utf-8") as handle:
+                json.dump(state, handle, ensure_ascii=False, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.path)
         except OSError as exc:
-            LOGGER.warning("Failed to persist position registry to %s: %s", self.path, exc)
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise RiskLimitError(
+                f"Position registry {self.path} could not be persisted; refusing to trade."
+            ) from exc

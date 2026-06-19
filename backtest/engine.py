@@ -83,6 +83,12 @@ def run_backtest(
     - Buy & hold over the same span is reported as the honest benchmark.
     """
     n = len(closes)
+    if len(highs) != n or len(lows) != n:
+        raise ValueError("High, low, and close series must have the same length.")
+    if fee_rate < 0 or fee_rate >= 1:
+        raise ValueError("fee_rate must be at least 0 and less than 1.")
+    if stop_loss_pct < 0 or stop_loss_pct >= 1:
+        raise ValueError("stop_loss_pct must be at least 0 and less than 1.")
     result = BacktestResult(n_bars=n)
     if n <= window:
         return result
@@ -100,7 +106,9 @@ def run_backtest(
         assert entry_price is not None
         gross = exit_price / entry_price
         net = gross * (1 - fee_rate) ** 2  # fee on entry and exit
-        fees += equity * (gross - net)
+        # Entry fee is recorded when the position opens. The exit fee is based
+        # on the marked exit value after the entry fee reduced the position.
+        fees += equity * (1 - fee_rate) * gross * fee_rate
         equity *= net
         peak = max(peak, equity)
         result.trades.append(
@@ -134,17 +142,23 @@ def run_backtest(
         if signal.signal == "buy" and entry_price is None:
             entry_price = closes[i]
             entry_index = i
+            fees += equity * fee_rate
         elif signal.signal == "sell" and entry_price is not None:
             close_trade(i, closes[i], "signal")
 
         if entry_price is not None:
-            mark = equity * (closes[i] / entry_price)
+            # Mark the value after the already-paid entry fee. Update the peak
+            # while a trade is open; otherwise a rise followed by a pullback
+            # would be omitted from maximum drawdown.
+            mark = equity * (1 - fee_rate) * (closes[i] / entry_price)
+            peak = max(peak, mark)
             result.max_drawdown_pct = max(result.max_drawdown_pct, (peak - mark) / peak)
         else:
             result.max_drawdown_pct = max(result.max_drawdown_pct, (peak - equity) / peak)
 
     if entry_price is not None:
         close_trade(n - 1, closes[-1], "end_of_data")
+        result.max_drawdown_pct = max(result.max_drawdown_pct, (peak - equity) / peak)
 
     result.total_return_pct = equity - 1.0
     result.total_fees_pct = fees

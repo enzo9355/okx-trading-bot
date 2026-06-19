@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import random
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Literal, TypeVar
 
@@ -19,6 +20,16 @@ from core.trade_logger import TradeLogger
 LOGGER = logging.getLogger(__name__)
 Direction = Literal["long", "short"]
 T = TypeVar("T")
+
+
+@dataclass(frozen=True)
+class ClosedPosition:
+    """Exchange close result paired with the exact position size it reduced."""
+
+    direction: Direction
+    contracts: float
+    order: dict[str, Any]
+
 
 # When several futures workers start at the same time (e.g. systemd restart, or
 # `--mode both` spinning up 5 symbols at once) they each call set_position_mode /
@@ -77,7 +88,10 @@ class FuturesTrader:
             self.exchange.load_markets()
             self.risk = RiskManager(settings, self.exchange)
             self.trade_logger = TradeLogger(settings.trade_log_file)
-            self.positions = PositionRegistry(settings.position_registry_file)
+            self.positions = PositionRegistry.for_mode(
+                settings.position_registry_file,
+                dry_run=settings.dry_run,
+            )
             self.configure_margin_and_leverage()
         except Exception:
             LOGGER.exception("Futures trader initialization failed.")
@@ -181,54 +195,85 @@ class FuturesTrader:
         if signal.signal == "hold":
             return None
 
-        equity = self.risk.assert_can_trade()
         price = self.fetch_last_price()
-        contracts = self.contracts_for_notional(self.risk.max_order_notional(equity), price)
 
         if signal.signal == "buy":
             closed = self.close_positions_by_direction("short")
             if closed:
                 self.positions.record_close("futures", self.symbol)
-                self._record_trade(signal, "close_short", contracts, price, closed[-1], reason="signal_flip")
+                for item in closed:
+                    self._record_trade(
+                        signal,
+                        "close_short",
+                        item.contracts,
+                        price,
+                        item.order,
+                        reason="signal_flip",
+                    )
             if self.has_open_position("long"):
                 LOGGER.info("Long position already open; skipping duplicate long entry.")
                 return None
             if not self._entry_allowed():
                 return None
-            order = self.open_long(contracts, price)
-            self.positions.record_open("futures", self.symbol, "long", contracts, price)
-            self._record_trade(signal, "long", contracts, price, order)
-            return order
+            equity = self.risk.assert_can_trade()
+            contracts = self.contracts_for_notional(self.risk.max_order_notional(equity), price)
+            with self.positions.entry_slot(
+                "futures",
+                self.symbol,
+                self.settings.max_open_positions,
+            ) as allowed:
+                if not allowed:
+                    LOGGER.info(
+                        "Futures %s entry skipped: max open positions reached (%d).",
+                        self.symbol,
+                        self.settings.max_open_positions,
+                    )
+                    return None
+                order = self.open_long(contracts, price)
+                self.positions.record_open("futures", self.symbol, "long", contracts, price)
+                self._record_trade(signal, "long", contracts, price, order)
+                return order
 
         closed = self.close_positions_by_direction("long")
         if closed:
             self.positions.record_close("futures", self.symbol)
-            self._record_trade(signal, "close_long", contracts, price, closed[-1], reason="signal_flip")
+            for item in closed:
+                self._record_trade(
+                    signal,
+                    "close_long",
+                    item.contracts,
+                    price,
+                    item.order,
+                    reason="signal_flip",
+                )
         if self.has_open_position("short"):
             LOGGER.info("Short position already open; skipping duplicate short entry.")
             return None
         if not self._entry_allowed():
             return None
-        order = self.open_short(contracts, price)
-        self.positions.record_open("futures", self.symbol, "short", contracts, price)
-        self._record_trade(signal, "short", contracts, price, order)
-        return order
+        equity = self.risk.assert_can_trade()
+        contracts = self.contracts_for_notional(self.risk.max_order_notional(equity), price)
+        with self.positions.entry_slot(
+            "futures",
+            self.symbol,
+            self.settings.max_open_positions,
+        ) as allowed:
+            if not allowed:
+                LOGGER.info(
+                    "Futures %s entry skipped: max open positions reached (%d).",
+                    self.symbol,
+                    self.settings.max_open_positions,
+                )
+                return None
+            order = self.open_short(contracts, price)
+            self.positions.record_open("futures", self.symbol, "short", contracts, price)
+            self._record_trade(signal, "short", contracts, price, order)
+            return order
 
     def _entry_allowed(self) -> bool:
-        """Gate new futures entries on the stop-out cooldown and the global
-        max-open-positions cap (shared with spot via the registry file)."""
+        """Block revenge entries; the atomic capacity gate runs at order time."""
         if self.positions.in_cooldown("futures", self.symbol):
             LOGGER.info("Futures %s entry skipped: in post-stop-out cooldown.", self.symbol)
-            return False
-        if (
-            not self.positions.has_position("futures", self.symbol)
-            and self.positions.open_count() >= self.settings.max_open_positions
-        ):
-            LOGGER.info(
-                "Futures %s entry skipped: max open positions reached (%d).",
-                self.symbol,
-                self.settings.max_open_positions,
-            )
             return False
         return True
 
@@ -349,12 +394,15 @@ class FuturesTrader:
             orders.append(self._close_position(position["side"], position["contracts"]))
         return orders
 
-    def close_positions_by_direction(self, direction: Direction) -> list[dict[str, Any]]:
-        orders = []
+    def close_positions_by_direction(self, direction: Direction) -> list[ClosedPosition]:
+        """Close matching positions and retain their actual sizes for logging."""
+        closed: list[ClosedPosition] = []
         for position in self.fetch_open_positions():
             if position["side"] == direction:
-                orders.append(self._close_position(direction, position["contracts"]))
-        return orders
+                contracts = float(position["contracts"])
+                order = self._close_position(direction, contracts)
+                closed.append(ClosedPosition(direction, contracts, order))
+        return closed
 
     def has_open_position(self, direction: Direction) -> bool:
         return any(position["side"] == direction for position in self.fetch_open_positions())

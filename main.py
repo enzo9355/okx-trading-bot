@@ -10,7 +10,7 @@ from time import monotonic
 from typing import Callable
 
 from core.config import Settings
-from core.risk import OrderRejected, RiskLimitError
+from core.risk import EntryHalted, OrderRejected, RiskLimitError
 from futures.trader import FuturesTrader
 from spot.trader import SpotTrader
 
@@ -70,8 +70,18 @@ def run_loop(
                 # A single order could not be placed (rounding, min size, transient
                 # API hiccup). Skip just this order and keep the worker running.
                 LOGGER.info("%s order skipped: symbol=%s reason=%s", kind, symbol, exc)
+            except EntryHalted as exc:
+                # Keep workers alive so existing spot stops, futures margin
+                # protection, and exchange-side stop reconciliation still run.
+                LOGGER.warning(
+                    "%s entry blocked by account risk control: symbol=%s reason=%s",
+                    kind,
+                    symbol,
+                    exc,
+                )
             except RiskLimitError as exc:
-                # An account-level limit (e.g. daily max loss) was hit. Stop everything.
+                # Persistent risk-state or registry failures are fail-closed: the
+                # bot cannot prove its limits are intact, so stop every worker.
                 LOGGER.error("%s trader stopped by risk control: symbol=%s error=%s", kind, symbol, exc)
                 stop_event.set()
                 return

@@ -141,7 +141,7 @@ class Settings:
             atr_period=_int_env("ATR_PERIOD", 14),
             atr_min_pct=_float_env("ATR_MIN_PCT", 0.001),
             atr_max_pct=_float_env("ATR_MAX_PCT", 0.05),
-            ma_min_trend_slope_pct=_float_env("MA_MIN_TREND_SLOPE_PCT", 0.0001),
+            ma_min_trend_slope_pct=_float_env("MA_MIN_TREND_SLOPE_PCT", 0.0003),
             spot_stop_loss_pct=_float_env("SPOT_STOP_LOSS_PCT", 0.02),
             max_open_positions=_int_env("MAX_OPEN_POSITIONS", 3),
             stop_out_cooldown_seconds=_int_env("STOP_OUT_COOLDOWN_SECONDS", 900),

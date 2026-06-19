@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 from core.position_registry import PositionRegistry
+from core.risk import RiskLimitError
 
 
 def _registry() -> PositionRegistry:
@@ -49,6 +50,29 @@ class PositionLifecycleTest(unittest.TestCase):
         path = Path(tempfile.mkdtemp()) / "positions.json"
         PositionRegistry(path).record_open("spot", "BTC/USDT", "long", 1.0, 100.0)
         self.assertTrue(PositionRegistry(path).has_position("spot", "BTC/USDT"))
+
+    def test_corrupt_registry_fails_closed(self) -> None:
+        path = Path(tempfile.mkdtemp()) / "positions.json"
+        path.write_text("{partial", encoding="utf-8")
+        with self.assertRaisesRegex(RiskLimitError, "refusing to trade"):
+            PositionRegistry(path).open_count()
+
+    def test_dry_run_uses_a_separate_registry_file(self) -> None:
+        path = Path(tempfile.mkdtemp()) / "positions.json"
+        live = PositionRegistry.for_mode(path, dry_run=False)
+        simulated = PositionRegistry.for_mode(path, dry_run=True)
+        simulated.record_open("spot", "BTC/USDT", "long", 1.0, 100.0)
+        self.assertNotEqual(live.path, simulated.path)
+        self.assertEqual(live.open_count(), 0)
+        self.assertEqual(simulated.open_count(), 1)
+
+    def test_entry_slot_enforces_the_global_cap(self) -> None:
+        reg = _registry()
+        reg.record_open("spot", "BTC/USDT", "long", 1.0, 100.0)
+        with reg.entry_slot("spot", "ETH/USDT", max_open_positions=1) as allowed:
+            self.assertFalse(allowed)
+        with reg.entry_slot("spot", "BTC/USDT", max_open_positions=1) as allowed:
+            self.assertTrue(allowed)
 
 
 class CooldownTest(unittest.TestCase):

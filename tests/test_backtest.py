@@ -45,7 +45,12 @@ class EngineMechanicsTest(unittest.TestCase):
         self.assertAlmostEqual(trade.gross_return_pct, (97 - 103) / 103, places=6)
         expected_net = (97 / 103) * (0.999**2) - 1
         self.assertAlmostEqual(result.total_return_pct, expected_net, places=6)
-        self.assertGreater(result.total_fees_pct, 0.0)
+        expected_fees = 0.001 + 0.999 * (97 / 103) * 0.001
+        self.assertAlmostEqual(result.total_fees_pct, expected_fees, places=9)
+
+    def test_invalid_series_lengths_are_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "same length"):
+            run_backtest([101.0] * 30, [99.0] * 29, [100.0] * 30, window=25, **RELAXED)
 
     def test_stop_loss_exits_at_stop_price(self) -> None:
         # Enter at 103, then crash bars whose lows pierce the 2% stop (100.94).
