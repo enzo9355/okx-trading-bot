@@ -152,10 +152,10 @@ class FuturesTrader:
             raise
 
     def run_once(self) -> dict[str, Any] | list[dict[str, Any]] | None:
-        breached, ratio = self.risk.margin_ratio_breached()
+        breached, ratio = self.risk.margin_ratio_breached(self.symbol)
         if breached:
             LOGGER.warning(
-                "Futures margin ratio %.4f is below %.4f. Closing all positions.",
+                "Futures margin ratio %.4f is at or above %.4f. Closing all positions.",
                 ratio,
                 self.settings.margin_ratio_threshold,
             )
@@ -181,38 +181,58 @@ class FuturesTrader:
         if signal.signal == "hold":
             return None
 
-        equity = self.risk.assert_can_trade()
         price = self.fetch_last_price()
-        contracts = self.contracts_for_notional(self.risk.max_order_notional(equity), price)
 
         if signal.signal == "buy":
             closed = self.close_positions_by_direction("short")
             if closed:
                 self.positions.record_close("futures", self.symbol)
-                self._record_trade(signal, "close_short", contracts, price, closed[-1], reason="signal_flip")
+                for closed_contracts, close_order in closed:
+                    self._record_trade(
+                        signal,
+                        "close_short",
+                        closed_contracts,
+                        price,
+                        close_order,
+                        reason="signal_flip",
+                    )
             if self.has_open_position("long"):
                 LOGGER.info("Long position already open; skipping duplicate long entry.")
                 return None
-            if not self._entry_allowed():
-                return None
-            order = self.open_long(contracts, price)
-            self.positions.record_open("futures", self.symbol, "long", contracts, price)
-            self._record_trade(signal, "long", contracts, price, order)
-            return order
+            with self.positions.entry_lock():
+                if not self._entry_allowed():
+                    return None
+                equity = self.risk.assert_can_trade()
+                contracts = self.contracts_for_notional(self.risk.max_order_notional(equity), price)
+                order = self.open_long(contracts, price)
+                self.positions.record_open("futures", self.symbol, "long", contracts, price)
+                self._record_trade(signal, "long", contracts, price, order)
+                return order
 
         closed = self.close_positions_by_direction("long")
         if closed:
             self.positions.record_close("futures", self.symbol)
-            self._record_trade(signal, "close_long", contracts, price, closed[-1], reason="signal_flip")
+            for closed_contracts, close_order in closed:
+                self._record_trade(
+                    signal,
+                    "close_long",
+                    closed_contracts,
+                    price,
+                    close_order,
+                    reason="signal_flip",
+                )
         if self.has_open_position("short"):
             LOGGER.info("Short position already open; skipping duplicate short entry.")
             return None
-        if not self._entry_allowed():
-            return None
-        order = self.open_short(contracts, price)
-        self.positions.record_open("futures", self.symbol, "short", contracts, price)
-        self._record_trade(signal, "short", contracts, price, order)
-        return order
+        with self.positions.entry_lock():
+            if not self._entry_allowed():
+                return None
+            equity = self.risk.assert_can_trade()
+            contracts = self.contracts_for_notional(self.risk.max_order_notional(equity), price)
+            order = self.open_short(contracts, price)
+            self.positions.record_open("futures", self.symbol, "short", contracts, price)
+            self._record_trade(signal, "short", contracts, price, order)
+            return order
 
     def _entry_allowed(self) -> bool:
         """Gate new futures entries on the stop-out cooldown and the global
@@ -349,11 +369,13 @@ class FuturesTrader:
             orders.append(self._close_position(position["side"], position["contracts"]))
         return orders
 
-    def close_positions_by_direction(self, direction: Direction) -> list[dict[str, Any]]:
-        orders = []
+    def close_positions_by_direction(self, direction: Direction) -> list[tuple[float, dict[str, Any]]]:
+        """Close one direction and retain its actual contract count for logging."""
+        orders: list[tuple[float, dict[str, Any]]] = []
         for position in self.fetch_open_positions():
             if position["side"] == direction:
-                orders.append(self._close_position(direction, position["contracts"]))
+                contracts = float(position["contracts"])
+                orders.append((contracts, self._close_position(direction, contracts)))
         return orders
 
     def has_open_position(self, direction: Direction) -> bool:

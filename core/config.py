@@ -16,7 +16,14 @@ def _bool_env(name: str, default: bool) -> bool:
     raw = os.getenv(name)
     if raw is None:
         return default
-    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "y", "on"}:
+        return True
+    if value in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError(
+        f"{name} must be an explicit boolean (true/false, yes/no, on/off, or 1/0); got {raw!r}."
+    )
 
 
 def _float_env(name: str, default: float) -> float:
@@ -141,7 +148,7 @@ class Settings:
             atr_period=_int_env("ATR_PERIOD", 14),
             atr_min_pct=_float_env("ATR_MIN_PCT", 0.001),
             atr_max_pct=_float_env("ATR_MAX_PCT", 0.05),
-            ma_min_trend_slope_pct=_float_env("MA_MIN_TREND_SLOPE_PCT", 0.0001),
+            ma_min_trend_slope_pct=_float_env("MA_MIN_TREND_SLOPE_PCT", 0.0003),
             spot_stop_loss_pct=_float_env("SPOT_STOP_LOSS_PCT", 0.02),
             max_open_positions=_int_env("MAX_OPEN_POSITIONS", 3),
             stop_out_cooldown_seconds=_int_env("STOP_OUT_COOLDOWN_SECONDS", 900),
@@ -191,10 +198,10 @@ class Settings:
             raise ValueError("FUTURES_LEVERAGE must remain fixed at 3.")
         if self.futures_position_mode not in {"net", "long_short"}:
             raise ValueError("FUTURES_POSITION_MODE must be either net or long_short.")
-        if self.futures_stop_loss_pct < 0:
-            raise ValueError("FUTURES_STOP_LOSS_PCT must be >= 0 (0 = disabled).")
-        if self.futures_take_profit_pct < 0:
-            raise ValueError("FUTURES_TAKE_PROFIT_PCT must be >= 0 (0 = disabled).")
+        if not 0 <= self.futures_stop_loss_pct < 1:
+            raise ValueError("FUTURES_STOP_LOSS_PCT must be >= 0 and < 1 (0 = disabled).")
+        if not 0 <= self.futures_take_profit_pct < 1:
+            raise ValueError("FUTURES_TAKE_PROFIT_PCT must be >= 0 and < 1 (0 = disabled).")
         if self.ohlcv_limit < 21:
             raise ValueError("OHLCV_LIMIT must be at least 21 for MA5/MA20 crossover.")
         if self.rsi_period < 2:
@@ -211,8 +218,8 @@ class Settings:
             raise ValueError("ATR_MAX_PCT must be greater than ATR_MIN_PCT.")
         if self.ma_min_trend_slope_pct < 0:
             raise ValueError("MA_MIN_TREND_SLOPE_PCT must be >= 0.")
-        if self.spot_stop_loss_pct < 0:
-            raise ValueError("SPOT_STOP_LOSS_PCT must be >= 0 (0 = disabled).")
+        if not 0 <= self.spot_stop_loss_pct < 1:
+            raise ValueError("SPOT_STOP_LOSS_PCT must be >= 0 and < 1 (0 = disabled).")
         if self.max_open_positions < 1:
             raise ValueError("MAX_OPEN_POSITIONS must be at least 1.")
         if self.stop_out_cooldown_seconds < 0:
