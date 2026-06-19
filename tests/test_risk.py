@@ -50,5 +50,54 @@ class ExceptionSeparationTest(unittest.TestCase):
         self.assertTrue(issubclass(RiskLimitError, RuntimeError))
 
 
+class OkxRiskMetricTest(unittest.TestCase):
+    def test_total_equity_is_preferred_over_quote_cash(self) -> None:
+        balance = {
+            "total": {"USDT": 850.0},
+            "free": {"USDT": 840.0},
+            "info": {"data": [{"totalEq": "1000.0", "adjEq": "990.0"}]},
+        }
+        self.assertEqual(RiskManager.extract_equity(balance, "USDT"), 1000.0)
+
+    def test_worst_open_position_margin_ratio_is_used(self) -> None:
+        positions = [
+            {"contracts": 1.0, "marginRatio": 0.08, "info": {}},
+            {"contracts": 2.0, "marginRatio": 0.21, "info": {}},
+            {"contracts": 0.0, "marginRatio": 0.90, "info": {}},
+        ]
+        self.assertEqual(RiskManager.extract_position_margin_ratio(positions), 0.21)
+
+    def test_raw_okx_position_ratio_is_inverted_as_fallback(self) -> None:
+        positions = [{"contracts": 1.0, "marginRatio": None, "info": {"mgnRatio": "5"}}]
+        self.assertAlmostEqual(RiskManager.extract_position_margin_ratio(positions) or 0, 0.2)
+
+    def test_margin_guard_trips_when_normalized_ratio_rises_to_threshold(self) -> None:
+        settings = replace(_settings_with_tmp_state(), margin_ratio_threshold=0.20)
+
+        class Exchange:
+            def fetch_positions(self, symbols: list[str]) -> list[dict]:
+                self.symbols = symbols
+                return [{"contracts": 1.0, "marginRatio": 0.25, "info": {}}]
+
+        risk = RiskManager(settings, Exchange())
+        self.assertEqual(risk.margin_ratio_breached("BTC/USDT:USDT"), (True, 0.25))
+
+
+class RiskStatePersistenceTest(unittest.TestCase):
+    def test_corrupt_existing_state_fails_closed(self) -> None:
+        settings = _settings_with_tmp_state()
+        settings.state_file.write_text('{"date":', encoding="utf-8")
+        with self.assertRaises(RiskLimitError):
+            RiskManager(settings, exchange=None)
+
+    def test_state_save_is_atomic(self) -> None:
+        settings = _settings_with_tmp_state()
+        risk = RiskManager(settings, exchange=None)
+        risk.state = {"date": "2026-06-20", "stopped": True}
+        risk._save_state()
+        self.assertTrue(settings.state_file.exists())
+        self.assertFalse(settings.state_file.with_name(f".{settings.state_file.name}.tmp").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

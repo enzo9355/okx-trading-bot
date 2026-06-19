@@ -1,8 +1,10 @@
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
-from core.position_registry import PositionRegistry
+from core.position_registry import PositionRegistry, PositionRegistryError
 
 
 def _registry() -> PositionRegistry:
@@ -49,6 +51,38 @@ class PositionLifecycleTest(unittest.TestCase):
         path = Path(tempfile.mkdtemp()) / "positions.json"
         PositionRegistry(path).record_open("spot", "BTC/USDT", "long", 1.0, 100.0)
         self.assertTrue(PositionRegistry(path).has_position("spot", "BTC/USDT"))
+
+    def test_corrupt_registry_fails_closed(self) -> None:
+        path = Path(tempfile.mkdtemp()) / "positions.json"
+        path.write_text('{"positions":', encoding="utf-8")
+        with self.assertRaises(PositionRegistryError):
+            PositionRegistry(path).open_count()
+
+    def test_atomic_save_leaves_no_temp_file(self) -> None:
+        path = Path(tempfile.mkdtemp()) / "positions.json"
+        PositionRegistry(path).record_open("spot", "BTC/USDT", "long", 1.0, 100.0)
+        self.assertTrue(path.exists())
+        self.assertFalse(path.with_name(f".{path.name}.tmp").exists())
+
+    def test_entry_lock_makes_global_cap_check_atomic(self) -> None:
+        reg = _registry()
+
+        def try_open(symbol: str) -> None:
+            with reg.entry_lock():
+                if reg.open_count() >= 1:
+                    return
+                time.sleep(0.02)
+                reg.record_open("spot", symbol, "long", 1.0, 100.0)
+
+        workers = [
+            threading.Thread(target=try_open, args=("BTC/USDT",)),
+            threading.Thread(target=try_open, args=("ETH/USDT",)),
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+        self.assertEqual(reg.open_count(), 1)
 
 
 class CooldownTest(unittest.TestCase):

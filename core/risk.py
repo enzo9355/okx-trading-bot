@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -85,24 +86,31 @@ class RiskManager:
             raise OrderRejected("Unable to read a positive account equity from OKX balance.")
         return equity
 
-    def fetch_margin_ratio(self) -> float | None:
-        balance = self.exchange.fetch_balance()
-        return self.extract_margin_ratio(balance)
+    def fetch_margin_ratio(self, symbol: str) -> float | None:
+        """Return the worst CCXT-normalized ratio for open isolated positions.
 
-    def margin_ratio_breached(self) -> tuple[bool, float | None]:
-        ratio = self.fetch_margin_ratio()
+        OKX's account-level ``mgnRatio`` is empty for isolated positions and its
+        raw position ratio uses the inverse convention. CCXT normalizes each
+        position to maintenance-margin / collateral, where a larger number is
+        closer to liquidation, so the guard must read positions directly.
+        """
+        positions = self.exchange.fetch_positions([symbol])
+        return self.extract_position_margin_ratio(positions)
+
+    def margin_ratio_breached(self, symbol: str) -> tuple[bool, float | None]:
+        """Trip as normalized maintenance usage rises toward liquidation."""
+        ratio = self.fetch_margin_ratio(symbol)
         if ratio is None:
             return False, None
-        return ratio < self.settings.margin_ratio_threshold, ratio
+        return ratio >= self.settings.margin_ratio_threshold, ratio
 
     @staticmethod
     def extract_equity(balance: dict[str, Any], quote_currency: str) -> float | None:
-        for section in ("total", "free"):
-            values = balance.get(section) or {}
-            value = _safe_float(values.get(quote_currency))
-            if value is not None and value > 0:
-                return value
-
+        """Prefer whole-account equity so asset purchases are not mistaken for losses."""
+        # OKX totalEq is the mark-to-market USD value of the whole trading
+        # account. Quote-currency balance is only cash and falls whenever spot
+        # is bought, which would create false "losses" while missing real losses
+        # in non-USDT holdings.
         info = balance.get("info") or {}
         for account in info.get("data") or []:
             for key in ("totalEq", "adjEq"):
@@ -117,24 +125,31 @@ class RiskManager:
                         if value is not None and value > 0:
                             return value
 
+        # Funding accounts and test doubles may not provide OKX's raw totalEq.
+        for section in ("total", "free"):
+            values = balance.get(section) or {}
+            value = _safe_float(values.get(quote_currency))
+            if value is not None and value > 0:
+                return value
+
         return None
 
     @staticmethod
-    def extract_margin_ratio(balance: dict[str, Any]) -> float | None:
-        info = balance.get("info") or {}
-        for account in info.get("data") or []:
-            for key in ("mgnRatio", "marginRatio"):
-                value = _safe_float(account.get(key))
-                if value is not None:
-                    return value
-
-            for detail in account.get("details") or []:
-                for key in ("mgnRatio", "marginRatio"):
-                    value = _safe_float(detail.get(key))
-                    if value is not None:
-                        return value
-
-        return None
+    def extract_position_margin_ratio(positions: list[dict[str, Any]]) -> float | None:
+        """Choose the riskiest open position using CCXT's high-is-bad convention."""
+        ratios: list[float] = []
+        for position in positions:
+            contracts = _safe_float(position.get("contracts")) or 0.0
+            if contracts <= 0:
+                continue
+            ratio = _safe_float(position.get("marginRatio"))
+            if ratio is None:
+                raw_ratio = _safe_float((position.get("info") or {}).get("mgnRatio"))
+                if raw_ratio is not None and raw_ratio > 0:
+                    ratio = 1 / raw_ratio
+            if ratio is not None and ratio >= 0:
+                ratios.append(ratio)
+        return max(ratios) if ratios else None
 
     def _sync_daily_loss_state(self, equity: float) -> None:
         with _STATE_LOCK:
@@ -176,13 +191,30 @@ class RiskManager:
         if not self.state_file.exists():
             return {}
         try:
-            return json.loads(self.state_file.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return {}
+            state = json.loads(self.state_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RiskLimitError(
+                f"Risk state {self.state_file} is unreadable; trading is disabled until it is repaired."
+            ) from exc
+        if not isinstance(state, dict):
+            raise RiskLimitError(f"Risk state {self.state_file} must contain a JSON object.")
+        return state
 
     def _save_state(self) -> None:
-        self.state_file.parent.mkdir(parents=True, exist_ok=True)
-        self.state_file.write_text(
-            json.dumps(self.state, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        """Atomically persist the circuit breaker so a crash cannot erase it."""
+        temp_path = self.state_file.with_name(f".{self.state_file.name}.tmp")
+        try:
+            self.state_file.parent.mkdir(parents=True, exist_ok=True)
+            with temp_path.open("w", encoding="utf-8") as handle:
+                json.dump(self.state, handle, ensure_ascii=False, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, self.state_file)
+        except OSError as exc:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise RiskLimitError(
+                f"Failed to persist risk state to {self.state_file}; trading is disabled."
+            ) from exc

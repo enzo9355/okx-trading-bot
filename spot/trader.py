@@ -41,48 +41,59 @@ class SpotTrader:
             f"{signal.slow_slope_pct:.4%}" if signal.slow_slope_pct is not None else "n/a",
         )
 
-        if signal.signal == "hold":
-            # Even with no signal, an open position still needs its stop checked.
-            self._check_stop_loss(signal)
-            return None
+        # Stops are independent of strategy signals. A buy/sell cross on the
+        # same cycle must never bypass an already-breached protective stop.
+        stop_order = self._check_stop_loss(signal)
+        if stop_order is not None:
+            return stop_order
 
-        price = self.fetch_last_price()
-        equity = self.risk.assert_can_trade()
-        amount = self.risk.amount_for_price(price, equity)
+        if signal.signal == "hold":
+            return None
 
         if signal.signal == "buy":
-            if self.positions.in_cooldown("spot", self.symbol):
-                LOGGER.info("Spot %s buy skipped: in post-stop-out cooldown.", self.symbol)
-                return None
-            if (
-                not self.positions.has_position("spot", self.symbol)
-                and self.positions.open_count() >= self.settings.max_open_positions
-            ):
-                LOGGER.info(
-                    "Spot %s buy skipped: max open positions reached (%d).",
-                    self.symbol,
-                    self.settings.max_open_positions,
-                )
-                return None
-            self.risk.assert_order_notional(amount * price, equity)
-            order = self.create_market_order("buy", amount)
-            self.positions.record_open("spot", self.symbol, "long", amount, price)
-            self._record_trade(signal, "buy", amount, price, order)
-            return order
+            with self.positions.entry_lock():
+                if self.positions.in_cooldown("spot", self.symbol):
+                    LOGGER.info("Spot %s buy skipped: in post-stop-out cooldown.", self.symbol)
+                    return None
+                if self.positions.has_position("spot", self.symbol):
+                    LOGGER.info("Spot %s position already open; skipping duplicate buy.", self.symbol)
+                    return None
+                if self.positions.open_count() >= self.settings.max_open_positions:
+                    LOGGER.info(
+                        "Spot %s buy skipped: max open positions reached (%d).",
+                        self.symbol,
+                        self.settings.max_open_positions,
+                    )
+                    return None
+                price = self.fetch_last_price()
+                equity = self.risk.assert_can_trade()
+                amount = self._normalize_amount(self.risk.amount_for_price(price, equity))
+                self.risk.assert_order_notional(amount * price, equity)
+                order = self.create_market_order("buy", amount)
+                self.positions.record_open("spot", self.symbol, "long", amount, price)
+                self._record_trade(signal, "buy", amount, price, order)
+                return order
 
-        base_free = self.fetch_base_free_balance()
-        sell_amount = min(base_free, amount)
-        if sell_amount <= 0:
-            LOGGER.info("Spot sell skipped because there is no free %s balance.", self.base_currency)
+        # A spot sell is an exit, not a fresh short. It must only touch the amount
+        # this bot registered and must remain available even after an account-level
+        # loss limit blocks new entries.
+        position = self.positions.get("spot", self.symbol)
+        if not position:
+            LOGGER.info("Spot sell skipped because this bot has no registered %s position.", self.symbol)
             return None
+        price = self.fetch_last_price()
+        base_free = self.fetch_base_free_balance()
+        sell_amount = min(base_free, float(position["amount"]))
+        if sell_amount <= 0:
+            raise OrderRejected(f"Spot exit blocked because there is no free {self.base_currency} balance.")
 
-        self.risk.assert_order_notional(sell_amount * price, equity)
+        sell_amount = self._normalize_amount(sell_amount)
         order = self.create_market_order("sell", sell_amount)
         self.positions.record_reduce("spot", self.symbol, sell_amount)
         self._record_trade(signal, "sell", sell_amount, price, order)
         return order
 
-    def _check_stop_loss(self, signal: MovingAverageSignal) -> None:
+    def _check_stop_loss(self, signal: MovingAverageSignal) -> dict[str, Any] | None:
         """Hard stop for bot-opened spot positions.
 
         The futures side has an exchange-attached stop; spot previously had NO
@@ -97,18 +108,23 @@ class SpotTrader:
         registered (bot-opened) amount — never pre-existing wallet holdings.
         """
         if self.settings.spot_stop_loss_pct <= 0:
-            return
+            return None
         position = self.positions.get("spot", self.symbol)
         if not position:
-            return
+            return None
         entry = float(position["entry_price"])
         stop_price = entry * (1 - self.settings.spot_stop_loss_pct)
         price = self.fetch_last_price()
         if price > stop_price:
-            return
+            return None
 
         base_free = self.fetch_base_free_balance()
         sell_amount = min(base_free, float(position["amount"]))
+        if sell_amount <= 0:
+            raise OrderRejected(
+                f"Spot stop-loss triggered for {self.symbol}, but no registered amount is free to sell."
+            )
+        sell_amount = self._normalize_amount(sell_amount)
         LOGGER.warning(
             "Spot %s STOP LOSS triggered: price=%.8g <= stop=%.8g (entry=%.8g). Selling %.8g.",
             self.symbol,
@@ -117,11 +133,11 @@ class SpotTrader:
             entry,
             sell_amount,
         )
-        if sell_amount > 0:
-            order = self.create_market_order("sell", sell_amount)
-            self._record_trade(signal, "sell", sell_amount, price, order, reason="stop_loss")
-        self.positions.record_close("spot", self.symbol)
+        order = self.create_market_order("sell", sell_amount)
+        self._record_trade(signal, "sell", sell_amount, price, order, reason="stop_loss")
+        self.positions.record_reduce("spot", self.symbol, sell_amount)
         self.positions.set_cooldown("spot", self.symbol, self.settings.stop_out_cooldown_seconds)
+        return order
 
     def _record_trade(
         self,

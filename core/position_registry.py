@@ -1,20 +1,28 @@
 from __future__ import annotations
 
 import json
-import logging
+import os
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
-
-LOGGER = logging.getLogger(__name__)
+from typing import Any, Iterator
 
 # One lock for the whole process: spot and futures workers share one registry file.
 _REGISTRY_LOCK = threading.Lock()
 
+# The count check, exchange order, and registry update must be one process-wide
+# operation. Otherwise two symbol workers can both observe one free slot and
+# exceed MAX_OPEN_POSITIONS before either records its new position.
+_ENTRY_LOCK = threading.Lock()
+
 # Positions smaller than this fraction of their original size are treated as closed
 # (precision rounding leaves dust after sells).
 _DUST_FRACTION = 0.01
+
+
+class PositionRegistryError(RuntimeError):
+    """Raised when ownership/risk state cannot be read or persisted safely."""
 
 
 class PositionRegistry:
@@ -102,6 +110,17 @@ class PositionRegistry:
     def has_position(self, market: str, symbol: str) -> bool:
         return self.get(market, symbol) is not None
 
+    @contextmanager
+    def entry_lock(self) -> Iterator[None]:
+        """Serialize entry admission through order placement and persistence.
+
+        The max-open-position limit is shared by every symbol worker. Holding
+        this lock across the check, exchange call, and registry write prevents
+        a check-then-act race from opening more positions than configured.
+        """
+        with _ENTRY_LOCK:
+            yield
+
     # ── stop-out cooldown ─────────────────────────────────────────────────
 
     def set_cooldown(self, market: str, symbol: str, seconds: int) -> None:
@@ -145,14 +164,34 @@ class PositionRegistry:
         if not self.path.exists():
             return {}
         try:
-            return json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            LOGGER.warning("Position registry file unreadable; starting from empty state.")
-            return {}
+            state = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise PositionRegistryError(
+                f"Position registry {self.path} is unreadable; refusing to trade without ownership state."
+            ) from exc
+        if not isinstance(state, dict):
+            raise PositionRegistryError(f"Position registry {self.path} must contain a JSON object.")
+        for section in ("positions", "cooldowns"):
+            if section in state and not isinstance(state[section], dict):
+                raise PositionRegistryError(
+                    f"Position registry {self.path} has an invalid {section!r} section."
+                )
+        return state
 
     def _save(self, state: dict[str, Any]) -> None:
+        temp_path = self.path.with_name(f".{self.path.name}.tmp")
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+            with temp_path.open("w", encoding="utf-8") as handle:
+                json.dump(state, handle, ensure_ascii=False, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, self.path)
         except OSError as exc:
-            LOGGER.warning("Failed to persist position registry to %s: %s", self.path, exc)
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise PositionRegistryError(
+                f"Failed to persist position registry to {self.path}; refusing to continue unsafely."
+            ) from exc
