@@ -102,11 +102,11 @@ Baseline: 30 tests passed. After the fixes in this review: 45 tests pass.
 - Location: `_reconcile_stop_outs`, now lines 280–314.
 - Finding: the registry lookup occurs first and returns at once when no position is registered. `has_open_position` and `fetch_last_price` are not called in that case.
 
-#### MAJOR — Live signals may use the still-open candle — OPEN
+#### MAJOR — Live signals may use the still-open candle — FIXED
 
 - Location: `fetch_signal`, lines 345–367; the same issue exists in `spot/trader.py` lines 203–225.
 - Problem: OKX/ccxt commonly includes the current, incomplete OHLCV bar. The bot polls every 60 seconds on a 15-minute timeframe and does not remove that bar. The backtest uses completed historical bars, so the claim that it replays the exact live decision is not reliable; intrabar crosses can appear and disappear before candle close.
-- Concrete fix: add one shared helper that compares the last candle timestamp plus parsed timeframe duration with exchange server time, drops the last candle when it is still open, and then requires at least `OHLCV_LIMIT` closed candles. Cover boundary timestamps with unit tests.
+- Fix: `core/market_data.py` now fetches one extra candle, compares the latest candle end with OKX server time, drops it while it is still open, and fails closed unless `OHLCV_LIMIT` completed candles remain. Spot and futures use the same helper. Boundary and insufficient-history tests cover the behavior.
 
 ### `scripts/verify_sl_attachment.py`
 
@@ -169,12 +169,12 @@ Baseline: 30 tests passed. After the fixes in this review: 45 tests pass.
 - Problem: when both average gain and average loss are zero, the `avg_loss == 0` branch returns 100. This is mathematically misleading, although a completely flat series does not create a crossover.
 - Concrete fix: return `50.0` when both averages are zero, then retain `100.0` for gain-only periods. Add flat, gain-only, and loss-only tests.
 
-## Phase 3 — next improvement
+## Phase 3 follow-up — completed
 
-Implement the shared **closed-candle filter** described under `futures/trader.py`. It is the highest-value low-risk next change because it makes live and backtest inputs comparable, needs no WebSocket or extra data source, and has negligible CPU/RAM cost. Until then, treat the existing backtest as a test of the signal formula, not a faithful replay of current live timing.
+The shared **closed-candle filter** described under `futures/trader.py` is implemented for both spot and futures signal paths. Live decisions and backtests now use completed candles rather than transient intrabar values.
 
 ## Verification performed
 
-- `python -m unittest discover -s tests -v`: **45 passed**.
+- `python -m unittest discover -s tests -v`: **48 passed**.
 - `git diff --check`: passed.
 - No OKX order was placed and no VM state was changed during this review.

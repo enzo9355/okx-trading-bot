@@ -6,6 +6,7 @@ from typing import Any
 
 from core.config import Settings
 from core.exchange import create_okx_exchange
+from core.market_data import fetch_closed_ohlcv
 from core.position_registry import PositionRegistry
 from core.risk import OrderRejected, RiskLimitError, RiskManager
 from core.strategy import MovingAverageSignal, filtered_ma_cross_signal
@@ -201,9 +202,10 @@ class SpotTrader:
         )
 
     def fetch_signal(self) -> MovingAverageSignal:
-        candles = self.exchange.fetch_ohlcv(
+        candles = fetch_closed_ohlcv(
+            self.exchange,
             self.symbol,
-            timeframe=self.settings.timeframe,
+            self.settings.timeframe,
             limit=self.settings.ohlcv_limit,
         )
         highs = [float(candle[2]) for candle in candles]
