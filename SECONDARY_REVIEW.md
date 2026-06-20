@@ -163,11 +163,11 @@ Baseline: 30 tests passed. After the fixes in this review: 45 tests pass.
 
 ### `core/strategy.py`
 
-#### MINOR — Flat-market RSI returns 100 instead of neutral 50 — OPEN
+#### MINOR — Flat-market RSI returns 100 instead of neutral 50 — FIXED
 
 - Location: `calculate_rsi`, lines 29–53.
 - Problem: when both average gain and average loss are zero, the `avg_loss == 0` branch returns 100. This is mathematically misleading, although a completely flat series does not create a crossover.
-- Concrete fix: return `50.0` when both averages are zero, then retain `100.0` for gain-only periods. Add flat, gain-only, and loss-only tests.
+- Fix: return `50.0` when average gain and loss are both zero, while retaining `100.0` for gain-only periods and `0.0` for loss-only periods. Tests cover all three cases.
 
 ## Phase 3 follow-up — completed
 
@@ -175,6 +175,6 @@ The shared **closed-candle filter** described under `futures/trader.py` is imple
 
 ## Verification performed
 
-- `python -m unittest discover -s tests -v`: **48 passed**.
+- `python -m unittest discover -s tests -v`: **51 passed**.
 - `git diff --check`: passed.
 - No OKX order was placed and no VM state was changed during this review.

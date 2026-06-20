@@ -1,9 +1,18 @@
 import unittest
 
-from core.strategy import calculate_atr_pct, filtered_ma_cross_signal
+from core.strategy import calculate_atr_pct, calculate_rsi, filtered_ma_cross_signal
 
 
 class StrategyTest(unittest.TestCase):
+    def test_flat_market_rsi_is_neutral(self) -> None:
+        self.assertEqual(calculate_rsi([100, 100, 100, 100], period=3), 50.0)
+
+    def test_gain_only_rsi_is_one_hundred(self) -> None:
+        self.assertEqual(calculate_rsi([100, 101, 102, 103], period=3), 100.0)
+
+    def test_loss_only_rsi_is_zero(self) -> None:
+        self.assertEqual(calculate_rsi([103, 102, 101, 100], period=3), 0.0)
+
     def test_atr_pct_uses_latest_close(self) -> None:
         highs = [11, 12, 13, 14]
         lows = [9, 10, 11, 12]
