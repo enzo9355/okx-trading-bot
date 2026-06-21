@@ -22,7 +22,10 @@ class _Exchange:
         self.cancelled = []
 
     def market(self, _symbol):
-        return {"id": "BTC-USDT-SWAP"}
+        return {
+            "id": "BTC-USDT-SWAP",
+            "limits": {"amount": {"min": 0.01}},
+        }
 
     def private_get_trade_orders_algo_pending(self, _params):
         return {"data": next(self.pending)}
@@ -99,7 +102,8 @@ class StopLossVerificationSafetyTest(unittest.TestCase):
         trader = _Trader([[], [wrong_stop], [exact_stop]])
 
         self.assertEqual(_run(trader), 0)
-        self.assertEqual(trader.closed, [2.0])
+        self.assertEqual(trader.opened, [(0.01, 100.0)])
+        self.assertEqual(trader.closed, [0.01])
         self.assertFalse(trader.closed_all)
         self.assertEqual(
             trader.exchange.cancelled,

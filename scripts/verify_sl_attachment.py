@@ -35,7 +35,8 @@ def main() -> int:
     settings.require_credentials()
 
     trader = FuturesTrader(settings, symbol=settings.futures_symbol)
-    inst_id = trader.exchange.market(trader.symbol)["id"]
+    market = trader.exchange.market(trader.symbol)
+    inst_id = market["id"]
 
     if trader.fetch_open_positions():
         LOGGER.error("Refusing to run: %s already has an open position.", trader.symbol)
@@ -48,7 +49,10 @@ def main() -> int:
         return 1
 
     price = trader.fetch_last_price()
-    contracts = trader.contracts_for_notional(trader.risk.max_order_notional(), price)
+    contracts = (market.get("limits", {}).get("amount", {}).get("min"))
+    if contracts is None or contracts <= 0:
+        LOGGER.error("Exchange did not provide a valid minimum order amount.")
+        return 1
     stop_loss, _ = trader._stop_loss_take_profit("long", price)
     if stop_loss <= 0:
         LOGGER.error("FUTURES_STOP_LOSS_PCT must be greater than zero.")
